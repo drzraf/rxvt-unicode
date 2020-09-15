@@ -1,0 +1,131 @@
+#!/bin/bash
+
+# Copyright (C) 2013, Raphaël . Droz + floss @ gmail DOT com
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+#
+# (urxvt) Relies upon the 730's "XTerm Operating System Command" in urxvt
+# to display images inside the terminal window while wrapping /bin/ls.
+# See: http://lists.schmorp.de/pipermail/rxvt-unicode/2013q1/001736.html
+# See: http://imgur.com/TdajM0c
+
+# Use:
+# ils [-l] [-s [<width>[x<height>]]] [-<N>] <files|dirs> ...
+
+# -l: use the "long" format: images are displayed at the end of each line
+# -s: set the size, default if 32px ratio-perserved. Height is also optionnal
+# -<N>: with <N> being an integer, set the number of column to use when multiple
+#	images are displayed inline (= number of images per line)
+
+# Examples:
+# $ ils image.png
+# display image.png inside the terminal window without any transformation.
+# Parts excessing terminal window dimensions will be hidden.
+
+# $ ils -s 64 -10 ~/dir
+# display, non-recursively, a table of all images from dir, using 10 thumbnails
+# per line, each one being 64px wide and respecting image ratio.
+
+# $ ils -l -s -1x90 *.jpg
+# display using the `ls -l` format all *.jpg. Thumbnail will be 90 pixels high
+# so all lines will be equally spaced from 90/<font-height> pixels.
+
+dir=
+name=
+long=
+help=
+let colnum=5
+let resize=0
+size=32x-1
+
+while [[ $1 ]]; do
+    if [[ $1 == -s ]]; then
+	shift; resize=1
+	if [[ $1 =~ ^[0-9-]+x[0-9-]+$ ]]; then size="$1"; shift
+	elif [[ $1 =~ ^[0-9-]+$ ]]; then size="$1x-1"; shift
+	else continue
+	fi
+    elif [[ $1 =~ ^-[0-9]+$ ]]; then colnum=${1:1}; shift
+    elif [[ $1 == -l ]]; then long='-l'; shift 
+    elif [[ $1 == -h ]]; then help=1; shift
+    else break
+    fi
+done
+
+if [[ -n $help ]]; then
+    cat<<EOF
+usage: $(basename $0) [-l | -X] [-s [size]] [name] ...
+Display images inside the (patched) urxvt window.
+	 name: an image file or a directory ("." if omitted)
+	 X: number of images per line
+	 size: W[xH], default to 32x-1
+EOF
+exit 1
+fi
+
+dir=.
+[[ -n "$1" ]] && dir="$1"
+
+
+trap "tputimg -F" exit
+
+if [[ $long ]]; then
+    if [[ -n $LS_COLORS ]]; then
+	cmd="ls -l --color=always"
+    else
+	cmd="ls -l"
+    fi
+
+    [[ -d "$dir" ]] && name="$dir" || name="$(dirname "$dir")"
+    $cmd "$@" | \
+	while read f; do
+	    [[ $f =~ :$ ]] && name=${f:0:-1}
+	    filename="$(printf "%s" "$f"|sed -e "s/\x1b\[0.;...//g" -e "s/\x1b\[0m//g" -e "s/\x1b\[K//g"|perl -lane 'print "@F[8..$#F]"')"
+	    [[ -z $filename || ! "$filename" =~ \.(png|jpg|gif|tiff)$ ]] && printf "%s\n" "$f" && continue
+	    if [[ -f $filename ]]; then
+		sed "s@\$@ $(tputimg -s "$size" -eW "${filename}")@"<<<"$f"
+	    else
+		# $dir may help us to find the dirname from which ls extracted images
+		sed "s@\$@ $(tputimg -s "$size" -eW "${name}/${filename}")@"<<<"$f"
+	    fi
+    done
+
+elif [[ -d "$dir" ]]; then
+    name="$dir" && shift
+    let j=0
+    for i in "$name/"*; do
+	mime=$(file -b --mime-type "$i" 2>/dev/null|cut -d'/' -f1)
+	[[ $mime != image ]] && continue;
+	((j++))
+	if (( $j == $colnum )); then
+	    j=0
+	    tputimg -s "$size" "$i"
+	else
+	    tputimg -s "$size" -i "$i"
+	fi
+    done
+    tputimg -F
+
+else
+    (( $resize )) && args="-s $size" || args=
+    files=( "$@" )
+    let j=0
+    for i in "${files[@]}"; do
+	mime=$(file -b --mime-type "$i" 2>/dev/null|cut -d'/' -f1)
+	[[ $mime != image ]] && continue;
+	((j++))
+	# default column number + no size specified, image go one
+	# under this other
+	if (( $j == $colnum || ( ! $resize && $colnum == 5 )  )) ; then
+	    j=0
+	    tputimg $args "$i"
+	else
+	    tputimg $args -i "$i"
+	fi
+    done
+    tputimg -F    
+fi

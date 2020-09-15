@@ -44,9 +44,18 @@ fill_text (text_t *start, text_t value, int len)
 /* ------------------------------------------------------------------------- *
  *             GENERAL SCREEN AND SELECTION UPDATE ROUTINES                  *
  * ------------------------------------------------------------------------- */
+#ifdef HAVE_IMAGES
+#define ZERO_SCROLLBACK()                                              \
+    if (option (Opt_scrollTtyOutput) && view_start) {	       	       \
+	pictures_set_next_expose(view_start, 0);      		       \
+	view_start = 0;					      	       \
+    }
+#else
 #define ZERO_SCROLLBACK()                                              \
     if (option (Opt_scrollTtyOutput))                                  \
         view_start = 0
+#endif
+
 #define CLEAR_SELECTION()                                              \
     selection.beg.row = selection.beg.col                              \
         = selection.end.row = selection.end.col = 0
@@ -394,7 +403,11 @@ rxvt_term::scr_reset ()
           // make sure all terminal lines exist
           while (top_row > 0)
             scr_blank_screen_mem (ROW (--top_row), DEFAULT_RSTYLE);
-        }
+
+#ifdef HAVE_IMAGES
+	  image_recompute_pos(prev_total_rows);
+#endif
+	}
       else
         {
           // if no scrollback exists (yet), wing, instead of wrap
@@ -461,6 +474,10 @@ void ecb_cold
 rxvt_term::scr_poweron ()
 {
   scr_release ();
+
+#ifdef HAVE_IMAGES
+  destroy_pictures();
+#endif
 
   prev_nrow = prev_ncol = 0;
   rvideo_mode = false;
@@ -652,6 +669,10 @@ rxvt_term::scr_scroll_text (int row1, int row2, int count) NOTHROW
 {
   if (count == 0 || (row1 > row2))
     return 0;
+
+#ifdef HAVE_IMAGES
+  pictures_set_next_expose(view_start, view_start + count);
+#endif
 
   want_refresh = 1;
   num_scr += count;
@@ -1886,6 +1907,14 @@ rxvt_term::scr_expose (int x, int y, int ewidth, int eheight, bool refresh) NOTH
 
   num_scr_allow = 0;
 
+#ifdef HAVE_IMAGES
+  // avoid loop, as pictures_need_expose is used inside scr_refresh()
+  // but if pictures_need_expose == 2, scr_expose() is not what we expected
+  // and a full refresh could still be needed: don't reset that flag.
+  if(pictures_need_expose == 1) pictures_need_expose = 0;
+  pictures_disp_y = pictures_disp_w = pictures_disp_h = 0;
+#endif
+
   if (refresh)
     scr_refresh ();
 }
@@ -1930,6 +1959,15 @@ rxvt_term::scr_changeview (int new_view_start) NOTHROW
 
   if (new_view_start == view_start)
     return false;
+
+#ifdef HAVE_IMAGES
+  /*
+    TODO: if there were images on the screen
+    here we need scr_expose() to fully refresh area
+    which used to be covered by the image
+  */
+  pictures_set_next_expose(view_start, new_view_start);
+#endif
 
   num_scr += new_view_start - view_start;
   view_start = new_view_start;
@@ -2053,6 +2091,36 @@ rxvt_term::scr_refresh () NOTHROW
   rend_t cur_rend;
   int cur_col;
   int cursorwidth;
+
+#ifdef HAVE_IMAGES
+  if(pictures_need_expose == 2)
+    {
+      // avoid loop, as scr_expose will call scr_refresh
+      pictures_need_expose = 0;
+      pictures_disp_y = pictures_disp_w = pictures_disp_h = 0;
+
+      // call scr_touch(), which reexpose the whole screen
+      scr_touch(true);
+      // or scr_recolour(true) if backgroud
+      return;
+    }
+  else if(pictures_need_expose == 1)
+    {
+      if(!pictures_disp_h)
+	{
+	  pictures_need_expose = pictures_disp_y = pictures_disp_w = pictures_disp_h = 0;
+	  // error-handling: !pictures_disp_h should not happens if(pictures_need_expose)
+	}
+      else
+	{
+	  // see rxvt_term::pictures_set_next_expose()
+	  scr_expose ( 0, pictures_disp_y,
+		       pictures_disp_w, pictures_disp_h,
+		       true );
+	  return;
+	}
+    }
+#endif
 
   want_refresh = 0;        /* screen is current */
 
@@ -2491,6 +2559,10 @@ rxvt_term::scr_refresh () NOTHROW
   scr_swap_overlay ();
 #endif
   HOOK_INVOKE ((this, HOOK_REFRESH_END, DT_END));
+
+#ifdef HAVE_IMAGES
+  render_pictures();
+#endif
 
   scr_reverse_selection ();
 
@@ -3693,5 +3765,97 @@ rxvt_term::scr_swap_overlay () NOTHROW
 }
 
 #endif
+
+#ifdef HAVE_IMAGES
+/*
+  This is called during scrolling or any other even implying image move on
+  screen, but before refresh actually happens.
+
+  Here is defined whether or not images will need refresh by setting
+  the `pictures_need_expose` bit and setup the part of the screen which will
+  need characters rewritten after the image scrolled.
+  (since render_pictures() can't know how much it changed from the previous
+  drawing).
+
+  If `pictures_need_expose` == 1 the next time scr_refresh() is fired,
+  a preliminary (but carefully restricted) call to scr_expose
+  will be made so no artifact are left from lines where the image does not
+  occupy anymore.
+  If `pictures_need_expose` == 2 the next time scr_refresh() is fired,
+  a call to scr_expose will be made covering the whole screen.
+
+
+  4 cases needs this precaution:
+
+  1) direct scrolling:
+  This is the original reason of the `new_view_start` parameter
+  This is done with a call from scr_changeview()
+  ( with scr_page() in mind )
+
+  2) adding a line ( scr_add_lines() ) and
+  2") having the last line to wrap (implying adding lines):
+  Both imply a call to scr_scroll_text() where minlines[count] is known.
+  In such a case new_view_start = view_start + count
+
+  3) resizing: TODO
+
+  4) each time output happens while view_start is < 0 what triggers
+  ZERO_SCROLLBACK
+
+
+  TODO: the first time we scr_index(UP) (after a picture is registered)
+  we don't need this function to run and should avoid that.
+  TODO: "quick"-scrolling leave garbage anyway.
+  TODO: use gdk_pixbuf_new_subpixbuf() so we can compute here the next region ?
+*/
+
+void rxvt_term::pictures_set_next_expose(int view_start, int new_view_start) {
+  // that means render_pictures() didn't display anything the last time
+  // it was called or a full-refresh is already queued.
+  if(pictures_disp_w == 0 || pictures_need_expose == 2)
+    {
+      return;
+    }
+
+  // more than one screen up or down, then
+  // no need for a partial refresh, the whole is needed
+  if(abs(view_start - new_view_start) >= nrow)
+    {
+      pictures_need_expose = 2;
+      return;
+    }
+
+  if(TermImages.size() > 1)
+    {
+      pictures_need_expose = 2;
+      return;
+    }
+
+  for (rxvt_embed_imge **img = TermImages.begin(); img != TermImages.end(); img++)
+    {
+      (*img)->request_reexpose(view_start, new_view_start);
+    }
+}
+
+void rxvt_term::image_recompute_pos(int prev_total_rows) {
+  /* printf("[image_recompute_pos] term_start = %d, view_start = %d, top_row = %d,"
+     " prev_total_rows = %d, total_rows = %d; prev_nrow = %d, nrow = %d\n",
+     term_start, view_start, top_row, prev_total_rows, total_rows, prev_nrow, nrow);*/
+
+  for (rxvt_embed_imge **img = TermImages.begin(); img != TermImages.end(); img++)
+    (*img)->recompute_pos(prev_total_rows);
+  term_start_jam = true;
+  pictures_need_expose = 2;
+}
+
+
+void rxvt_term::destroy_pictures() {
+  // <simplevect>clear() wouldn't call each ~destructor()
+  for (rxvt_embed_imge **img = TermImages.begin(); img != TermImages.end(); img++)
+    delete *img;
+  TermImages.clear();
+}
+#endif
+
 /* ------------------------------------------------------------------------- */
 

@@ -1974,6 +1974,10 @@ rxvt_term::button_press (XButtonEvent &ev)
         }
 
       MEvent.time = ev.time;
+
+#ifdef HAVE_IMAGES
+      render_pictures();
+#endif
       return;
     }
 
@@ -3537,6 +3541,12 @@ rxvt_term::process_xterm_seq (int op, char *str, char resp)
         process_color_seq (op, Color_border, str, resp);
         break;
 
+#ifdef HAVE_IMAGES
+      case URxvt_image:
+	if (*str != ';') register_picture(str);
+	break;
+#endif
+
       case XTerm_logfile:
         // TODO, when secure mode?
         break;
@@ -4152,6 +4162,106 @@ void rxvt_term::pty_write ()
   else if (written != -1 || (errno != EAGAIN && errno != EINTR))
     pty_ev.set (ev::READ);
 }
+
+
+#ifdef HAVE_IMAGES
+
+#define UNSCROLLED	(view_start == 0)
+// UNSCROLLED, is false if we are at the very bottom
+// of the screen and added newlines are going to push
+// the image up to the top of the visible area
+#define IMAGE_TOP_FULLY_VISIBLE(I) (I->pos.row >= top_no() + ( UNSCROLLED ? 0 : -1 ))
+// true if fully visible only
+#define IMAGE_FULLY_VISIBLE(I)	(IMAGE_TOP_FULLY_VISIBLE(I) && I->bottom_fully_visible())
+
+
+/*
+  There are also cases where images needs to be redrawn again
+  but the terminal did not changed.
+
+  2 cases:
+  - selecting over the image
+  - focus in/out
+
+  TODO////
+*/
+
+void rxvt_term::register_picture(const char *str) {
+  unsigned int flags;
+  int sw, sh, x, y;
+  char *file = NULL;
+
+  GdkPixbuf *new_image;
+  rxvt_embed_imge *InTermImage;
+
+  rxvt_embed_imge::pictures_parse_params(str, file, flags, sw, sh, x, y);
+  // printf("file = %s, flags = %d, sw = %d, sh = %d\n", file, flags, sw, sh);
+  // fprintf(stderr, "[reg] row = %d, nrow = %d, term_start = %d, view_start = %d\n", screen.cur.row, nrow, term_start, view_start);
+
+  if (!file || ! (new_image = rxvt_embed_imge::getGdkPixbuf(file, flags, sw, sh)))
+    {
+      if (flags & IMG_FLUSH && pictures_next_vpad) {
+	screen.cur.col = 0;
+	while (pictures_next_vpad--) scr_index(UP);
+	pictures_next_vpad = 0;
+      }
+      return;
+    }
+
+  InTermImage = new rxvt_embed_imge(this, strdup(file), new_image, flags);
+  InTermImage->set_pos(x, y);
+  InTermImage->set_cursor();
+  TermImages.push_back(InTermImage);
+  want_refresh = 1;
+  // after scr_index(UP) from the above set_pos(), and if a picture
+  // was already on-screen, we may need a call to scr_recolour()
+  if(TermImages.size() > 1)
+    {
+      pictures_need_expose = 2; // TODO: if(&& other picts visible)
+    }
+}
+
+/*
+  From gdk/contrib/gdk-pixbuf-xlib/gdk-pixbuf-xlibrgb.c:xlib_draw_rgb_image_core(),
+  gdk_pixbuf_xlib_render_to_drawable() relies on XPutImage().
+  That means no exposure notification is available
+  // http://tronche.com/gui/x/xlib/events/exposure/graphics-expose-and-no-expose.html
+  // XSetGraphicsExposures(dpy, gc, true);
+  That's why we needs to compute `pictures_disp_*` here
+  and in rxvt_term::pictures_set_next_expose().
+*/
+
+void rxvt_term::render_pictures() {
+  pictures_disp_w = 0;
+
+  for (rxvt_embed_imge **img = TermImages.begin ();
+       img != TermImages.end ();
+       img++) {
+
+    // TODO: start from end() and return if !(*img)->visible()
+    if(! (*img)->visible())
+      {
+	continue;
+      }
+
+    // store the screen width an image occupies so we
+    // can refresh (even empty) lines up to this width when
+    // we scroll
+    // TODO: what about picture starting at col N ?
+    // => currently this refreshes from 0 up to N
+    pictures_disp_w = max(pictures_disp_w, (*img)->width);
+
+    // IMAGE_FULLY_VISIBLE(TermImages) ?
+
+    // http://developer.gnome.org/gdk-pixbuf/stable/gdk-pixbuf-Xlib-Rendering.html#gdk-pixbuf-xlib-render-threshold-alpha
+    gdk_pixbuf_xlib_render_to_drawable((*img)->pictures, vt, gc, 0, 0,
+				       Width2Pixel((*img)->pos.col),
+				       Row2Pixel((*img)->pos.row - (term_start + view_start)),
+				       (*img)->width, (*img)->height, XLIB_RGB_DITHER_NONE, 0, 0);
+  }
+}
+
+#endif
 
 /*----------------------- end-of-file (C source) -----------------------*/
 

@@ -1,0 +1,47 @@
+#!/bin/bash
+
+# Copyright (C) 2013, Raphaël . Droz + floss @ gmail DOT com
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+# (urxvt) Relies upon the 730's "XTerm Operating System Command" in urxvt
+# to display images inside the terminal window.
+# This is a kind of wrapper to the tput utility intended to specifically
+# wrap "display-image" urxvt code.
+
+# It takes simple options and call the equivalent Xterm sequence.
+# see doc/images.txt in the urxvt sources^Wpatch
+
+param=
+dim=32x-1
+while getopts ":s:ieFW" opt; do
+    case $opt in
+	s)
+	    [[ $OPTARG =~ ^[0-9-]+x[0-9-]+$ ]] && dim=$OPTARG
+	    param+="dim:$dim;"
+	    ;;
+	i)
+	    param+="pad:novert;"
+	    ;;
+	e)
+	    param+="pos:eol;"
+	    ;;
+	W)
+	    param+="wrap;"
+	    ;;
+	F)
+	    # fake path for the "flush" flag
+	    printf "\33]730;%s;%s\007" "/" "flush"
+	    exit 0
+	    ;;
+    esac
+done
+shift $((OPTIND-1))
+
+[[ ! -f "$1" ]] && echo "[$(basename $0)]can't find file $1" >&2 && exit 1
+
+# path must be absolute
+printf "\33]730;%s;%s\007" "$(realpath "$1")" "${param}"

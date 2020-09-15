@@ -27,6 +27,7 @@ doc/.cvsignore
 doc/Makefile.in
 doc/README.xvt
 doc/changes.txt
+doc/images.txt
 doc/podtbl
 
 doc/rxvt.1.pod
@@ -86,6 +87,9 @@ src/version.h
 src/xdefaults.C
 src/emman.h
 src/emman.c
+src/image.h
+src/image.C
+src/image.C
 
 libptytty/Changes
 libptytty/ptytty.m4

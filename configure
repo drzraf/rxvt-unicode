@@ -630,6 +630,9 @@ PERL
 XFT_CONFIG
 STARTUP_NOTIFICATION_LIBS
 STARTUP_NOTIFICATION_CFLAGS
+IMAGES_O
+IMAGES_LIBS
+IMAGES_CFLAGS
 PIXBUF_LIBS
 PIXBUF_CFLAGS
 PKG_CONFIG
@@ -719,6 +722,7 @@ enable_combining
 enable_xft
 enable_font_styles
 enable_pixbuf
+enable_images
 enable_startup_notification
 enable_transparency
 enable_fading
@@ -1403,6 +1407,7 @@ Optional Features:
   --enable-xft            enable xft support on systems that have it
   --enable-font-styles    enable bold and italic support
   --enable-pixbuf         enable integration with gdk-pixbuf for background images
+  --enable-images         enable the display of images inside the terminal
   --enable-startup-notification  enable freedesktop startup notification support
   --enable-transparency   enable transparent backgrounds
   --enable-fading         enable colors fading when off focus
@@ -4753,6 +4758,7 @@ support_scroll_next=yes
 support_scroll_xterm=yes
 support_xim=yes
 support_pixbuf=yes
+support_images=no
 support_startup_notification=yes
 support_xft=yes
 support_unicode3=no
@@ -4785,6 +4791,7 @@ if test "${enable_everything+set}" = set; then :
        support_wtmp=no
        support_xim=no
        support_pixbuf=no
+       support_images=no
        support_startup_notification=no
        support_xft=no
        support_unicode3=no
@@ -4813,6 +4820,7 @@ if test "${enable_everything+set}" = set; then :
        support_wtmp=yes
        support_xim=yes
        support_pixbuf=yes
+       support_images=yes
        support_startup_notification=yes
        support_xft=yes
        support_unicode3=yes
@@ -4928,6 +4936,13 @@ if test "${enable_pixbuf+set}" = set; then :
   fi
 fi
 
+
+# Check whether --enable-images was given.
+if test "${enable_images+set}" = set; then :
+  enableval=$enable_images; if test x$enableval = xyes -o x$enableval = xno; then
+    support_images=$enableval
+  fi
+fi
 
 # Check whether --enable-startup-notification was given.
 if test "${enable_startup_notification+set}" = set; then :
@@ -6478,6 +6493,10 @@ image_lib=none
 PIXBUF_CFLAGS=
 PIXBUF_LIBS=
 
+IMAGES_CFLAGS=
+IMAGES_LIBS=
+IMAGES_O=
+
 if test x$support_pixbuf = xyes; then
 
   { $as_echo "$as_me:${as_lineno-$LINENO}: checking for gdk-pixbuf-2.0" >&5
@@ -6500,7 +6519,30 @@ $as_echo "no" >&6; }
     :
   fi
 
+
+  # this relies on core-pixbuf too
+  if test x$support_pixbuf = xyes && test x$support_images = xyes; then
+     { $as_echo "$as_me:${as_lineno-$LINENO}: checking for gdk-pixbuf-xlib-2.0" >&5
+$as_echo_n "checking for gdk-pixbuf-xlib-2.0... " >&6; }
+     if $PKG_CONFIG --exists gdk-pixbuf-xlib-2.0; then
+        IMAGES_CFLAGS="`$PKG_CONFIG gdk-pixbuf-xlib-2.0 --cflags`"
+	IMAGES_LIBS="`$PKG_CONFIG gdk-pixbuf-xlib-2.0 --libs`"
+	IMAGES_O=image.o
+	{ $as_echo "$as_me:${as_lineno-$LINENO}: result: ok" >&5
+$as_echo "ok" >&6; }
+
+$as_echo "#define HAVE_IMAGES 1" >>confdefs.h
+
+     else
+	{ $as_echo "$as_me:${as_lineno-$LINENO}: result: no" >&5
+$as_echo "no" >&6; }
+     fi
+  fi
 fi
+
+
+
+
 
 
 

@@ -1,0 +1,97 @@
+This document how images are handled by urxvt.
+Images are only XImage (through gdkpixbuf) which are displayed over
+the characters area. Their position is kept consistent across terminal
+actions.
+
+Code: 730
+$ printf '\33]730;<FORMAT>\007'
+
+Simple example:
+$ printf '\33]730;hello.jpg\007'
+
+Full <FORMAT> is:
+  <filename>;[flag[:<flag-options>];]...
+
+
+  <filename> is an absolute path-name
+  <options> are colon-separated words.
+  flag could be:
+
+  - "pad": about padding: Padding is not about the area around the image,
+    	   but area "under" the image.
+    Options are:
+    - horiz: add horizontal padding (ie move the "cursor" horizontally).
+      	     The cursor will stay on the same line while moving right the
+	     needed number of columns according to image width.
+    - vert: add vertical padding (ie move the "cursor" vertically X times
+      	    according to image height).
+      	    The next characters or images displayed will not override the
+	    image vertically nor horizontally.
+	    Unless "horiz" is set, "vert" set cursor column to 0, ie:
+	    the cursor will start at the beginning of the next usable line.
+    - nohoriz: this keeps the cursor from moving horizontally after the
+      	       image is displayed.
+    - novert: this keeps the cursor from moving vertically after the
+      	      image is displayed. This is used to display images "inline".
+    - nocum: by default, when "novert" is used, vertical spacing is needed
+      	     to avoid the next prompt to override images. This option,
+	     mostly useful with "novert" ensure that successive vertical
+	     spacing are "stored" and "additioned" so that, after the first
+	     image ending the line ("vert"), a correct number of newlines is
+	     added. See the "flush" flag.
+
+
+    Default is: "vert"
+    If "novert" is used, default becomes "horiz" + "nocum"
+
+
+  - "dim": about dimensions of the image.
+    Options are:
+    - scale: Scale the image to the exact width and height specified.
+      	     If exactly one of width or height is -1, scale will
+	     respect the image ratio.
+    - size: Scale down the image to at most WxH while always preserving
+	    the ratio.
+	    Both width and height (unsigned int) must be specified.
+    - %dx%d: Any other value is passed to sscanf("%dx%d") and treated as
+      	     the couple of dimension separated by the "x" character.
+
+    Default is to not apply any transformation to the image.
+    If only a valid couple of dimensions are provided, default are:
+    - scale: if one of the dimension is -1
+    - size: if both dimensions are positive
+    no dimensioning is done otherwise
+
+
+  - "pos": about positioning.
+    Options are:
+    - rel: position is relative to the current cursor position.
+    - abs: position is relative to the current top-left edge of the visible
+      	   area of the terminal.
+    - eol: the image is put at the nearest to end-of-line possible position.
+    - %dx%d: Any other value is passed to sscanf("%dx%d") and treated as
+      	     the couple of coordinates separated by the "x" character.
+
+    Default is to not apply any coordinate-based positioning to the image.
+    If only coordinates are provided, default are:
+    - abs: if one coordinate is negative
+    - rel: otherwise
+
+    If "abs" or "rel" is used, every padding-related options are ignored
+    and spacing (cursor movement), if needed, must be handled manually.
+    If "eol" is used, padding-related options apply.
+
+
+  - "flush": this flag relates to padding. If used, filename must be empty or
+    	     non-existent. If a queued vertical-padding exists (after one or
+	     multiple inline'd images were displayed (using "novert"), then
+	     newlines will finally be printed.
+	     This flags does not take options.
+
+
+  - "wrap": not implemented yet. No options are available.
+    This flag set the behavior when resizing occurs.
+    If "wrap" is set and resizing-down occurs, image will wrap if it can't
+    fit in the space between it's left edge and the right border of the terminal.
+    If pos:eol is set, and resizing-up occurs images will always stick to the
+    right border of the terminal.
