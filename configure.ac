@@ -83,6 +83,7 @@ support_scroll_next=yes
 support_scroll_xterm=yes
 support_xim=yes
 support_pixbuf=yes
+support_images=no
 support_startup_notification=yes
 support_xft=yes
 support_unicode3=no
@@ -117,6 +118,7 @@ AC_ARG_ENABLE(everything,
        support_scroll_xterm=no
        support_xim=no
        support_pixbuf=no
+       support_images=no
        support_startup_notification=no
        support_xft=no
        support_unicode3=no
@@ -142,6 +144,7 @@ AC_ARG_ENABLE(everything,
        support_scroll_xterm=yes
        support_xim=yes
        support_pixbuf=yes
+       support_images=yes
        support_startup_notification=yes
        support_xft=yes
        support_unicode3=yes
@@ -234,6 +237,13 @@ AC_ARG_ENABLE(pixbuf,
      [enable integration with gdk-pixbuf for background images])],
   [if test x$enableval = xyes -o x$enableval = xno; then
     support_pixbuf=$enableval
+  fi])
+
+AC_ARG_ENABLE(images,
+  [AS_HELP_STRING([--enable-images],
+     [enable the display of images inside the terminal])],
+  [if test x$enableval = xyes -o x$enableval = xno; then
+    support_images=$enableval
   fi])
 
 AC_ARG_ENABLE(startup-notification,
@@ -480,15 +490,31 @@ image_lib=none
 PIXBUF_CFLAGS=
 PIXBUF_LIBS=
 
+IMAGES_CFLAGS=
+IMAGES_LIBS=
+IMAGES_O=
+
 if test x$support_pixbuf = xyes; then
   RXVT_CHECK_MODULES([PIXBUF], [gdk-pixbuf-2.0], [
     image_lib=gdk-pixbuf
     AC_DEFINE(HAVE_PIXBUF, 1, Define if you want to use gdk-pixbuf for image processing)
   ], [:])
+
+  # this relies on core-pixbuf too
+  if test x$support_pixbuf = xyes && test x$support_images = xyes; then
+     RXVT_CHECK_MODULES([IMAGES], [gdk-pixbuf-xlib-2.0], [
+        IMAGES_O=image.o
+        AC_DEFINE(HAVE_IMAGES, 1, Define if you want to display images inside urxvt)
+     ], [:])
+  fi
 fi
 
 AC_SUBST(PIXBUF_CFLAGS)
 AC_SUBST(PIXBUF_LIBS)
+
+AC_SUBST(IMAGES_CFLAGS)
+AC_SUBST(IMAGES_LIBS)
+AC_SUBST(IMAGES_O)
 
 STARTUP_NOTIFICATION_CFLAGS=
 STARTUP_NOTIFICATION_LIBS=

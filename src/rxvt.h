@@ -76,6 +76,9 @@ typedef  int32_t tlen_t_; // specifically for use in the line_t structure
 
 #if HAVE_PIXBUF
 # include <gdk-pixbuf/gdk-pixbuf.h>
+#if HAVE_IMAGES
+# include <gdk-pixbuf-xlib/gdk-pixbuf-xlib.h>
+#endif
 #endif
 
 #if XRENDER && (HAVE_PIXBUF || ENABLE_TRANSPARENCY)
@@ -440,6 +443,7 @@ enum {
   Rxvt_restoreFG         = 39,
   Rxvt_restoreBG         = 49,
 
+  Rxvt_Images            = 21,      // insert a picture
   Rxvt_dumpscreen        = 55,      // dump scrollback and all of screen
 
   URxvt_locale           = 701,     // change locale
@@ -925,6 +929,10 @@ typedef struct
   int col;
 } row_col_t;
 
+#ifdef HAVE_IMAGES
+#include "image.h"
+#endif
+
 /*
  * terminal limits:
  *
@@ -1207,6 +1215,45 @@ struct rxvt_term : zero_initialized, rxvt_vars, rxvt_screen
                         rend_t rend = OVERLAY_RSTYLE) noexcept;
   void scr_overlay_set (int x, int y, const char *s) noexcept;
   void scr_overlay_set (int x, int y, const wchar_t *s) noexcept;
+#endif
+
+#ifdef HAVE_IMAGES
+  // handful
+  int bottom_no() {
+	  return term_start + view_start + nrow - 1;
+  }
+  int top_no() {
+	  return term_start + view_start;
+  }
+  int32_t row2pixel(int32_t n) {
+	  return (int32_t)(n) * (int32_t)fheight;
+  }
+  int32_t col2pixel(int32_t n) {
+	  return (int32_t)(n) * (int32_t)fwidth;
+  }
+
+  simplevec<_InTermImage *> TermImages;
+  // next vertical padding when several images are
+  // displayed on a same line
+  uint8_t pictures_next_vpad;
+
+  void register_picture(const char *string);
+  void render_pictures();
+
+  // screen refresh
+  uint16_t  pictures_need_expose;
+  uint16_t  pictures_disp_w;
+  uint16_t  pictures_disp_y;
+  uint16_t  pictures_disp_h;
+  void pictures_set_next_expose(int view_start, int new_view_start);
+  bool term_start_jam;
+  void image_recompute_pos(int prev_total_rows);
+
+  // cleanup scrollback, handle screen reset
+  int  pictures_size_limit;
+  int  pictures_limit;
+  void destroy_pictures();
+  void pictures_cleanup_scrollback(int byno, int bymem);
 #endif
 
   vector<void *> allocated;           // free these memory blocks with free()

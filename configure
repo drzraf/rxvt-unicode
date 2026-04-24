@@ -659,6 +659,9 @@ EGREP
 GREP
 STARTUP_NOTIFICATION_LIBS
 STARTUP_NOTIFICATION_CFLAGS
+IMAGES_O
+IMAGES_LIBS
+IMAGES_CFLAGS
 PIXBUF_LIBS
 PIXBUF_CFLAGS
 PTYTTY_LIBS
@@ -739,6 +742,7 @@ enable_combining
 enable_xft
 enable_font_styles
 enable_pixbuf
+enable_images
 enable_startup_notification
 enable_transparency
 enable_fading
@@ -1403,17 +1407,21 @@ Optional Features:
   --disable-option-checking  ignore unrecognized --enable/--with options
   --disable-FEATURE       do not include FEATURE (same as --enable-FEATURE=no)
   --enable-FEATURE[=ARG]  include FEATURE [ARG=yes]
-  --enable-everything     enable standard non-multichoice features
-                          NOTE: this option is order dependent
+  --enable-everything     enable standard non-multichoice features NOTE: this
+                          option is order dependent
   --enable-assert         enable assertions
   --enable-warnings       turn on g++ warnings
   --enable-256-color      enable 256-color support
-  --enable-unicode3       use 21 instead of 16 bits to represent unicode characters
+  --enable-unicode3       use 21 instead of 16 bits to represent unicode
+                          characters
   --enable-combining      enable composition of base and combining characters
   --enable-xft            enable xft support on systems that have it
   --enable-font-styles    enable bold and italic support
-  --enable-pixbuf         enable integration with gdk-pixbuf for background images
-  --enable-startup-notification  enable freedesktop startup notification support
+  --enable-pixbuf         enable integration with gdk-pixbuf for background
+                          images
+  --enable-images         enable the display of images inside the terminal
+  --enable-startup-notification
+                          enable freedesktop startup notification support
   --enable-transparency   enable transparent backgrounds
   --enable-fading         enable colors fading when off focus
   --enable-rxvt-scroll    enable rxvt style scrollbar
@@ -1425,14 +1433,18 @@ Optional Features:
   --disable-delete-key    disable handling of the delete key
   --disable-resources     disable all resource checking
   --enable-8bitctrls      enable 8 bit control sequences (not recommended)
-  --enable-fallback[=CLASS] fall back on CLASS resources in addition to URxvt ones (default: Rxvt)
+  --enable-fallback[=CLASS]
+                          fall back on CLASS resources in addition to URxvt
+                          ones (default: Rxvt)
   --disable-swapscreen    disable swap screen support
   --enable-iso14755       enable support for extended ISO 14755 modes
   --enable-frills         enable support for rarely used features
   --enable-keepscrolling  enable continual scrolling on scrollbar arrow press
-  --enable-selectionscrolling  enable scrolling during selections
+  --enable-selectionscrolling
+                          enable scrolling during selections
   --enable-mousewheel     enable scrolling via mouse wheel or buttons 4 & 5
-  --enable-slipwheeling   enable slip wheel scrolling (requires --enable-mousewheel)
+  --enable-slipwheeling   enable slip wheel scrolling (requires
+                          --enable-mousewheel)
   --enable-smart-resize   enable smart growth/shrink behaviour
   --enable-text-blink     enable blinking text
   --enable-pointer-blank  enable pointer blanking when typing or inactive
@@ -1440,12 +1452,15 @@ Optional Features:
 Optional Packages:
   --with-PACKAGE[=ARG]    use PACKAGE [ARG=yes]
   --without-PACKAGE       do not use PACKAGE (same as --with-PACKAGE=no)
-  --with-codesets=CS,...  compile in additional codesets (jp,jp_ext,kr,zh,zh_ext,all)
-  --with-res-name=NAME    use this as default resource name (default: urxvt)
-  --with-res-class=CLASS  use this as the resource class (default: URxvt)
-  --with-name=NAME        set the basename for the installed binaries (default: urxvt)
-  --with-term=NAME        set the terminal to NAME (default: rxvt)
-  --with-terminfo=PATH    set the path to the terminfo tree to PATH
+  --with-codesets=CS,...  compile in additional codesets
+                          (jp,jp_ext,kr,zh,zh_ext,all)
+  --with-res-name=NAME    set the default resource name (default: urxvt)
+  --with-res-class=CLASS  set the resource class (default: URxvt)
+  --with-name=NAME        set the basename for the installed binaries
+                          (default: urxvt)
+  --with-term=VALUE       set the value of the TERM environment variable
+                          (default: rxvt)
+  --with-terminfo=VALUE   set the value of the TERMINFO environment variable
   --with-x                use the X Window System
 
 Some influential environment variables:
@@ -4355,11 +4370,11 @@ if test x$ac_prog_cxx_stdcxx = xno
 then :
   { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for $CXX option to enable C++11 features" >&5
 printf %s "checking for $CXX option to enable C++11 features... " >&6; }
-if test ${ac_cv_prog_cxx_11+y}
+if test ${ac_cv_prog_cxx_cxx11+y}
 then :
   printf %s "(cached) " >&6
 else $as_nop
-  ac_cv_prog_cxx_11=no
+  ac_cv_prog_cxx_cxx11=no
 ac_save_CXX=$CXX
 cat confdefs.h - <<_ACEOF >conftest.$ac_ext
 /* end confdefs.h.  */
@@ -4401,11 +4416,11 @@ if test x$ac_prog_cxx_stdcxx = xno
 then :
   { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for $CXX option to enable C++98 features" >&5
 printf %s "checking for $CXX option to enable C++98 features... " >&6; }
-if test ${ac_cv_prog_cxx_98+y}
+if test ${ac_cv_prog_cxx_cxx98+y}
 then :
   printf %s "(cached) " >&6
 else $as_nop
-  ac_cv_prog_cxx_98=no
+  ac_cv_prog_cxx_cxx98=no
 ac_save_CXX=$CXX
 cat confdefs.h - <<_ACEOF >conftest.$ac_ext
 /* end confdefs.h.  */
@@ -4986,6 +5001,7 @@ support_scroll_next=yes
 support_scroll_xterm=yes
 support_xim=yes
 support_pixbuf=yes
+support_images=no
 support_startup_notification=yes
 support_xft=yes
 support_unicode3=no
@@ -5016,6 +5032,7 @@ then :
        support_scroll_xterm=no
        support_xim=no
        support_pixbuf=no
+       support_images=no
        support_startup_notification=no
        support_xft=no
        support_unicode3=no
@@ -5041,6 +5058,7 @@ then :
        support_scroll_xterm=yes
        support_xim=yes
        support_pixbuf=yes
+       support_images=yes
        support_startup_notification=yes
        support_xft=yes
        support_unicode3=yes
@@ -5170,6 +5188,15 @@ if test ${enable_pixbuf+y}
 then :
   enableval=$enable_pixbuf; if test x$enableval = xyes -o x$enableval = xno; then
     support_pixbuf=$enableval
+  fi
+fi
+
+
+# Check whether --enable-images was given.
+if test ${enable_images+y}
+then :
+  enableval=$enable_images; if test x$enableval = xyes -o x$enableval = xno; then
+    support_images=$enableval
   fi
 fi
 
@@ -6872,6 +6899,10 @@ image_lib=none
 PIXBUF_CFLAGS=
 PIXBUF_LIBS=
 
+IMAGES_CFLAGS=
+IMAGES_LIBS=
+IMAGES_O=
+
 if test x$support_pixbuf = xyes; then
 
   { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for gdk-pixbuf-2.0 (using pkg-config)" >&5
@@ -6894,7 +6925,36 @@ printf "%s\n" "no" >&6; }
     :
   fi
 
+
+  # this relies on core-pixbuf too
+  if test x$support_pixbuf = xyes && test x$support_images = xyes; then
+
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for gdk-pixbuf-xlib-2.0 (using pkg-config)" >&5
+printf %s "checking for gdk-pixbuf-xlib-2.0 (using pkg-config)... " >&6; }
+  if test $PKG_CONFIG != no && $PKG_CONFIG --exists gdk-pixbuf-xlib-2.0; then
+    IMAGES_CFLAGS="`$PKG_CONFIG --cflags gdk-pixbuf-xlib-2.0`"
+    IMAGES_LIBS="`$PKG_CONFIG --libs gdk-pixbuf-xlib-2.0`"
+
+    { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: ok" >&5
+printf "%s\n" "ok" >&6; }
+
+        IMAGES_O=image.o
+
+printf "%s\n" "#define HAVE_IMAGES 1" >>confdefs.h
+
+
+  else
+    { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; }
+    :
+  fi
+
+  fi
 fi
+
+
+
+
 
 
 

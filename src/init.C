@@ -598,6 +598,12 @@ rxvt_term::init_vars ()
   set_option (Opt_iso14755);
   set_option (Opt_iso14755_52);
   set_option (Opt_buffered);
+
+#if HAVE_IMAGES
+  pictures_next_vpad = 0;
+  pictures_need_expose = 0;
+  term_start_jam = false;
+#endif
 }
 
 #if ENABLE_PERL
@@ -1518,6 +1524,10 @@ rxvt_term::create_windows (int argc, const char *const *argv)
   gc = XCreateGC (dpy, vt,
                   GCForeground | GCBackground | GCGraphicsExposures,
                   &gcvalue);
+
+#ifdef HAVE_IMAGES
+  xlib_rgb_init_with_depth(dpy, DefaultScreenOfDisplay(dpy), -1);
+#endif
 
   drawable = new rxvt_drawable (this, vt);
 
