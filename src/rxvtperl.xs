@@ -1639,6 +1639,13 @@ rxvt_term::view_start (int newval = 0)
         OUTPUT:
 	RETVAL
 
+int
+rxvt_term::term_start ()
+	CODE:
+        RETVAL = THIS->term_start;
+        OUTPUT:
+	RETVAL
+
 void
 rxvt_term::set_urgency (bool enable)
 
@@ -2115,6 +2122,16 @@ void
 rxvt_term::scr_bell ()
 
 void
+rxvt_term::scr_expose (int x, int y, int width, int height, bool refresh = true)
+	CODE:
+        THIS->scr_expose (x, y, width, height, refresh);
+
+void
+rxvt_term::scr_touch (bool refresh = true)
+	CODE:
+        THIS->scr_touch (refresh);
+
+void
 rxvt_term::scr_recolor (bool refresh = true);
 
 void
@@ -2128,6 +2145,11 @@ rxvt_term::scr_add_lines (SV *string)
         THIS->scr_add_lines (wstr, wcslen (wstr));
         free (wstr);
 }
+
+void
+rxvt_term::scr_index (int direction)
+	CODE:
+        THIS->scr_index (static_cast<enum page_dirn>(direction));
 
 void
 rxvt_term::tt_write_user_input (SV *octets)
@@ -2557,6 +2579,33 @@ rxvt_img::contrast (rxvt_img::nv r, rxvt_img::nv g, rxvt_img::nv b, rxvt_img::nv
 
 void
 rxvt_img::draw (rxvt_img *img, int op = PictOpOver, rxvt_img::nv mask = 1.);
+
+void
+rxvt_img::render (Drawable drawable, int x = 0, int y = 0, int width = 0, int height = 0)
+	CODE:
+        if (width == 0) width = THIS->w;
+        if (height == 0) height = THIS->h;
+
+        Window root;
+        int dx, dy;
+        unsigned int dw, dh, dbw, depth;
+        XGetGeometry (THIS->d->dpy, drawable, &root, &dx, &dy, &dw, &dh, &dbw, &depth);
+
+        XRenderPictFormat templ;
+        templ.type = PictTypeDirect;
+        templ.depth = depth;
+        XRenderPictFormat *format = XRenderFindFormat (THIS->d->dpy,
+                                                        PictFormatType | PictFormatDepth,
+                                                        &templ, 0);
+
+        Picture dst = XRenderCreatePicture (THIS->d->dpy, drawable, format, 0, 0);
+        Picture src = THIS->picture ();
+
+        XRenderComposite (THIS->d->dpy, PictOpOver, src, None, dst,
+                          0, 0, 0, 0, x, y, width, height);
+
+        XRenderFreePicture (THIS->d->dpy, src);
+        XRenderFreePicture (THIS->d->dpy, dst);
 
 rxvt_img *
 rxvt_img::clone ()

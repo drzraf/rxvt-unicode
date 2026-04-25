@@ -5,6 +5,7 @@ XID			T_UV
 Atom			T_UV
 Window			T_UV
 Pixmap			T_UV
+Drawable		T_UV
 Region			T_UV
 rxvt_img::nv		T_NV
 

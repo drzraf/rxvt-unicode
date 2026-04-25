@@ -1,0 +1,672 @@
+#! perl
+
+=head1 NAME
+
+images - in-terminal image display support
+
+=head1 SYNOPSIS
+
+   urxvt -pe images
+
+=head1 DESCRIPTION
+
+This extension implements in-terminal image display using OSC 21 escape sequences.
+Images are displayed as XImage overlays positioned consistently across terminal actions.
+
+=head2 OSC 21 Format
+
+   printf '\33]21;<filename>;[flag[:<flag-options>];]...\007'
+
+=head2 Examples
+
+   # Simple display
+   printf '\33]21;/path/to/image.jpg\007'
+
+   # Scaled to 300x200
+   printf '\33]21;/path/to/image.jpg;dim:300x200\007'
+
+   # Inline display (no vertical padding)
+   printf '\33]21;/path/to/image.jpg;pad:novert\007'
+
+=head2 Flags
+
+=over 4
+
+=item B<pad> - Padding/cursor movement control
+
+Options: horiz, vert, nohoriz, novert, nocum
+
+=item B<dim> - Image dimensions
+
+Options: scale, size, WxH (e.g., 300x200)
+
+=item B<pos> - Image positioning
+
+Options: rel, abs, eol, XxY coordinates
+
+=item B<flush> - Flush queued vertical padding
+
+No options. Filename must be empty.
+
+=back
+
+=cut
+
+# Image flags (matching C implementation)
+use constant {
+    IMG_NOFLAG  => 0,
+    IMG_HPAD    => 1,
+    IMG_VPAD    => 2,
+    IMG_CVPAD   => 4,
+    IMG_SCALED  => 8,
+    IMG_SIZED   => 16,
+    IMG_RATIO   => 32,
+    IMG_FLOW    => 64,
+    IMG_RPOS    => 128,
+    IMG_POS     => 256,
+    IMG_EOL     => 512,
+    IMG_WRAP    => 1024,
+    IMG_FLUSH   => 2048,
+};
+
+# Plugin state
+sub on_init {
+    my ($self) = @_;
+
+    # Image storage: array of image objects
+    $self->{images} = [];
+
+    # Cumulative vertical padding for inline images
+    $self->{cumulative_vpad} = 0;
+
+    # Expose system (matches C implementation)
+    # 0 = no expose needed, 1 = partial expose, 2 = full screen expose
+    $self->{images_need_expose} = 0;
+    $self->{expose_y} = 0;
+    $self->{expose_h} = 0;
+
+    # Track previous view_start for expose calculations
+    $self->{prev_view_start} = 0;
+
+    1
+}
+
+# Handle OSC 21 sequences
+sub on_osc_seq {
+    my ($self, $op, $args, $resp) = @_;
+
+    return unless $op == 21;  # OSC 21 is for images
+
+    # Parse the OSC sequence
+    my ($filename, $flags, $sw, $sh, $x, $y) = $self->parse_params($args);
+
+    # Handle flush command
+    if ($flags & IMG_FLUSH) {
+        $self->flush_vpad();
+        return 1;
+    }
+
+    # Validate filename
+    return unless $filename && -f $filename;
+
+    # Load and scale the image using rxvt_img API
+    my $img_obj = $self->load_image($filename, $flags, $sw, $sh);
+    return unless $img_obj;
+
+    # Create image object
+    my $img = {
+        img      => $img_obj,
+        filename => $filename,
+        flags    => $flags,
+        width    => $img_obj->w(),
+        height   => $img_obj->h(),
+        pos_row  => 0,
+        pos_col  => 0,
+    };
+
+    # Save current state for image placement (BEFORE scrolling)
+    my ($saved_row, $saved_col) = $self->screen_cur();
+    my $saved_term_start = $self->term_start;
+    my $saved_view_start = $self->view_start;
+
+    # Set position using saved state (BEFORE scrolling)
+    # This matches C: set_pos() is called before set_cursor()
+    $self->set_image_position_at($img, $x, $y, $saved_row, $saved_col, $saved_term_start, $saved_view_start);
+
+    # Handle cursor movement (moves cursor for NEXT content)
+    # This scrolls the screen, but image position is already set
+    $self->handle_cursor_movement($img);
+
+    # Store the image
+    push @{$self->{images}}, $img;
+
+    # Trigger refresh
+    $self->want_refresh();
+
+    1
+}
+
+# Parse OSC 21 parameters
+sub parse_params {
+    my ($self, $string) = @_;
+
+    # Match C implementation defaults exactly
+    my $flags = IMG_HPAD | IMG_CVPAD | IMG_VPAD;
+    my ($sw, $sh) = (0, -2);
+    my ($x, $y) = (0, 0);
+
+    # Split by semicolon
+    my @parts = split /;/, $string;
+    my $filename = shift @parts;
+
+    # Parse flags
+    foreach my $part (@parts) {
+        my ($flag, $opts) = split /:/, $part, 2;
+        $opts //= '';
+
+        if ($flag eq 'pad') {
+            $flags = $self->parse_pad_flags($opts, $flags);
+        }
+        elsif ($flag eq 'dim') {
+            ($flags, $sw, $sh) = $self->parse_dim_flags($opts, $flags, $sw, $sh);
+        }
+        elsif ($flag eq 'pos') {
+            ($flags, $x, $y) = $self->parse_pos_flags($opts, $flags);
+        }
+        elsif ($flag eq 'flush') {
+            $flags |= IMG_FLUSH;
+        }
+        elsif ($flag eq 'wrap') {
+            $flags |= IMG_WRAP;
+        }
+    }
+
+    # Post-parsing adjustments (match C implementation lines 314-328)
+
+    # Default positioning when only coords were given
+    if (!($flags & IMG_POS) && !($flags & IMG_RPOS) && ($x | $y)) {
+        $flags |= (($x < 0 || $y < 0) ? IMG_RPOS : IMG_POS);
+    }
+
+    # Scaling or sizing makes no sense without dimensions or if both are negative
+    if (($sw < $sh ? $sw : $sh) < -1) {
+        $flags &= ~(IMG_SIZED | IMG_SCALED);
+    }
+    # Size without other precision => default to "scale" if one dim < 0, "size" otherwise
+    elsif (!($flags & IMG_SIZED) && !($flags & IMG_SCALED)) {
+        $flags |= (($sw < 0 || $sh < 0) ? IMG_SCALED : IMG_SIZED);
+    }
+
+    # Simple end-of-line takes priority over specific (rel or abs) position
+    if ($flags & IMG_EOL) {
+        $flags &= ~(IMG_POS | IMG_RPOS);
+    }
+
+    # IMG_RATIO is only a handful internal flag
+    if (($flags & IMG_SCALED) && (($sw == -1) != ($sh == -1))) {
+        $flags |= IMG_RATIO;
+    }
+
+    # If precise position is requested, padding & co are up to the user
+    if (($flags & IMG_POS) || ($flags & IMG_RPOS)) {
+        $flags &= ~(IMG_HPAD | IMG_VPAD | IMG_CVPAD);
+    }
+
+    # If we pad with newlines, tabulations are senseless
+    if ($flags & IMG_VPAD) {
+        $flags &= ~IMG_HPAD;
+    }
+
+    return ($filename, $flags, $sw, $sh, $x, $y);
+}
+
+# Parse padding flags
+sub parse_pad_flags {
+    my ($self, $opts, $flags) = @_;
+
+    # Match C implementation - parse each option
+    foreach my $opt (split /:/, $opts) {
+        if ($opt eq 'horiz') {
+            $flags |= IMG_HPAD;
+        }
+        elsif ($opt eq 'vert') {
+            $flags |= IMG_VPAD;
+        }
+        elsif ($opt eq 'nohoriz') {
+            $flags &= ~(IMG_HPAD | IMG_CVPAD);
+        }
+        elsif ($opt eq 'novert') {
+            $flags &= ~IMG_VPAD;
+        }
+        elsif ($opt eq 'nocum') {
+            $flags &= ~IMG_CVPAD;
+        }
+    }
+
+    return $flags;
+}
+
+# Parse dimension flags
+sub parse_dim_flags {
+    my ($self, $opts, $flags, $sw, $sh) = @_;
+
+    # Match C implementation - parse each option
+    foreach my $opt (split /:/, $opts) {
+        if ($opt eq 'scale') {
+            $flags |= IMG_SCALED;
+            $flags &= ~IMG_SIZED;
+        }
+        elsif ($opt eq 'size') {
+            $flags |= IMG_SIZED;
+            $flags &= ~IMG_SCALED;
+        }
+        elsif ($opt eq 'ratio') {
+            $flags |= IMG_RATIO;
+        }
+        elsif ($opt =~ /^(-?\d+)x(-?\d+)$/) {
+            ($sw, $sh) = ($1, $2);
+        }
+    }
+
+    return ($flags, $sw, $sh);
+}
+
+# Parse position flags
+sub parse_pos_flags {
+    my ($self, $opts, $flags) = @_;
+    my ($x, $y) = (0, 0);
+
+    if ($opts eq 'rel') {
+        $flags |= IMG_RPOS;
+    }
+    elsif ($opts eq 'abs') {
+        $flags |= IMG_POS;
+    }
+    elsif ($opts eq 'eol') {
+        $flags |= IMG_EOL;
+    }
+    elsif ($opts =~ /^(-?\d+)x(-?\d+)$/) {
+        ($x, $y) = ($1, $2);
+        if ($x < 0 || $y < 0) {
+            $flags |= IMG_POS;  # Absolute
+        } else {
+            $flags |= IMG_RPOS;  # Relative
+        }
+    }
+
+    return ($flags, $x, $y);
+}
+
+# Load and optionally scale an image using rxvt_img API
+sub load_image {
+    my ($self, $filename, $flags, $sw, $sh) = @_;
+
+    # Load the image using rxvt_img API (handles all color depths properly)
+    my $img = eval { $self->new_img_from_file($filename) };
+    return unless $img;
+
+    # Apply scaling if requested
+    if ($flags & IMG_SIZED) {
+        # IMG_SIZED: exact pixel dimensions
+        my $scaled = $img->scale($sw, $sh);
+        $img = $scaled if $scaled;
+    }
+    elsif ($flags & IMG_SCALED) {
+        # IMG_SCALED: scale with optional aspect ratio preservation
+        if ($flags & IMG_RATIO) {
+            # Preserve aspect ratio - calculate dimensions
+            my $orig_w = $img->w;
+            my $orig_h = $img->h;
+
+            if ($sw < 0 && $sh >= 0) {
+                # Scale by height, preserve aspect
+                $sw = int($orig_w * $sh / $orig_h);
+            } elsif ($sh < 0 && $sw >= 0) {
+                # Scale by width, preserve aspect
+                $sh = int($orig_h * $sw / $orig_w);
+            }
+        }
+
+        if ($sw > 0 && $sh > 0) {
+            my $scaled = $img->scale($sw, $sh);
+            $img = $scaled if $scaled;
+        }
+    }
+
+    return $img;
+}
+
+# Set image position based on flags using saved cursor position
+sub set_image_position_at {
+    my ($self, $img, $x, $y, $saved_row, $saved_col, $saved_term_start, $saved_view_start) = @_;
+
+    my $flags = $img->{flags};
+
+    # Convert screen-relative cursor position to absolute buffer position
+    # C code: pos.row = term_start + screen.cur.row (line 101 in image.C)
+    # Use SAVED term_start value before scrolling
+    my $absolute_row = $saved_term_start + $saved_row;
+
+    if ($flags & IMG_POS) {
+        # Absolute positioning - use y directly as absolute row
+        $img->{pos_row} = $y;
+        $img->{pos_col} = $x;
+    }
+    elsif ($flags & IMG_RPOS) {
+        # Relative positioning
+        # C code: pos.row = term_start + view_start + y (line 113 in image.C)
+        $img->{pos_row} = $saved_term_start + $saved_view_start + $y;
+        $img->{pos_col} = $saved_col + $x;
+    }
+    elsif ($flags & IMG_EOL) {
+        # End of line positioning
+        my $img_width_cols = int(($img->{width} + $self->fwidth - 1) / $self->fwidth);
+        $img->{pos_row} = $absolute_row;
+        $img->{pos_col} = $self->ncol - $img_width_cols;
+    }
+    else {
+        # Flow positioning (at absolute cursor position)
+        $img->{pos_row} = $absolute_row;
+        $img->{pos_col} = $saved_col;
+    }
+}
+
+# Handle cursor movement after image placement
+# Match C implementation's set_cursor() function
+sub handle_cursor_movement {
+    my ($self, $img) = @_;
+
+    my $flags = $img->{flags};
+
+    # Calculate image dimensions in character cells
+    my $img_width_cols = int(($img->{width} + $self->fwidth - 1) / $self->fwidth);
+    my $img_height_rows = int(($img->{height} + $self->fheight - 1) / $self->fheight);
+
+    # Don't move cursor if absolute/relative positioning
+    return if $flags & (IMG_POS | IMG_RPOS);
+
+    # Update cumulative vertical padding
+    if ($flags & IMG_CVPAD) {
+        # Take the maximum of current cumulative and this image's height
+        $self->{cumulative_vpad} = $img_height_rows
+            if $img_height_rows > $self->{cumulative_vpad};
+    }
+
+    # HPAD implies no VPAD (horizontal padding)
+    if ($flags & IMG_HPAD) {
+        # Move cursor right by image width
+        my ($row, $col) = $self->screen_cur();
+        $col += $img_width_cols;
+        if ($col >= $self->ncol) {
+            $col = 0;
+            $row++;
+        }
+        $self->screen_cur($row, $col);
+        return;
+    }
+
+    # VPAD: Scroll screen up to create blank lines
+    # Match C implementation exactly: scr_index(UP)
+    if ($flags & IMG_VPAD) {
+        my $newlines = $img_height_rows;
+
+        # Use accumulated padding if available
+        if ($self->{cumulative_vpad} > 0) {
+            $newlines = $self->{cumulative_vpad};
+        }
+
+        # Call scr_index(UP) for each newline
+        # UP = 1 (from enum page_dirn in rxvt.h)
+        while ($newlines--) {
+            $self->scr_index(1);
+        }
+
+        # Set cursor to column 0
+        my ($row, $col) = $self->screen_cur();
+        $self->screen_cur($row, 0);
+
+        # Reset cumulative padding
+        $self->{cumulative_vpad} = 0;
+    }
+}
+
+# Flush cumulative vertical padding
+sub flush_vpad {
+    my ($self) = @_;
+
+    if ($self->{cumulative_vpad} > 0) {
+        my ($row, $col) = $self->screen_cur();
+        $self->screen_cur($row + $self->{cumulative_vpad}, 0);
+        $self->{cumulative_vpad} = 0;
+    }
+}
+
+# Render all visible images
+sub on_refresh_end {
+    my ($self) = @_;
+
+    return unless $self->{images} && @{$self->{images}};
+
+    # Don't render images on alternate screen (e.g., when nano/vim/etc. is running)
+    # PRIMARY = 0, SECONDARY = 1
+    return if $self->current_screen != 0;
+
+    my $term_start = $self->term_start;
+    my $view_start = $self->view_start;
+    my $nrow = $self->nrow;
+
+    # C code: top_no() = term_start + view_start
+    # C code: bottom_no() = term_start + view_start + nrow - 1
+    my $top_no = $term_start + $view_start;
+    my $bottom_no = $top_no + $nrow - 1;
+
+    foreach my $img (@{$self->{images}}) {
+        # Calculate image dimensions in rows
+        my $img_height_rows = int(($img->{height} + $self->fheight - 1) / $self->fheight);
+        my $bottom_lineno = $img->{pos_row} + $img_height_rows;
+
+        # C code visibility check:
+        # visible() = pos.row <= bottom_no() && bottom_visible()
+        # bottom_visible() = bottom_lineno >= top_no
+        next unless $img->{pos_row} <= $bottom_no && $bottom_lineno >= $top_no;
+
+        # Calculate screen position
+        # C code: row2pixel(pos.row - top_no())
+        my $screen_row = $img->{pos_row} - $top_no;
+
+        # Calculate pixel coordinates
+        # C code: row2pixel() converts row to pixels
+        my $x = $img->{pos_col} * $self->fwidth;
+        my $y = $screen_row * $self->fheight;
+
+        # Render the image using rxvt_img API (properly handles all color depths)
+        $img->{img}->render($self->vt, $x, $y, $img->{width}, $img->{height});
+    }
+
+    1
+}
+
+# Handle view changes (scrolling)
+# Implements C code's request_reexpose() function with precise expose regions
+sub on_view_change {
+    my ($self) = @_;
+
+    return unless $self->{images} && @{$self->{images}};
+
+    my $old_view_start = $self->{prev_view_start};
+    my $new_view_start = $self->view_start;
+
+    # Save for next time
+    $self->{prev_view_start} = $new_view_start;
+
+    # Calculate scroll distance
+    my $scroll_distance = abs($new_view_start - $old_view_start);
+
+    # If scrolled more than one screen, do full refresh
+    if ($scroll_distance >= $self->nrow) {
+        $self->{images_need_expose} = 2;  # Full screen
+        $self->want_refresh();
+        return 1;
+    }
+
+    # For smaller scrolls, calculate precise expose regions for each visible image
+    # This matches the C implementation's request_reexpose() logic
+    if ($scroll_distance > 0) {
+        my $term_start = $self->term_start;
+        my $top_no = $term_start + $new_view_start;
+        my $bottom_no = $top_no + $self->nrow - 1;
+
+        my $min_y = $self->height;
+        my $max_h = 0;
+        my $need_expose = 0;
+
+        foreach my $img (@{$self->{images}}) {
+            # Check if image is visible
+            my $img_height_rows = int(($img->{height} + $self->fheight - 1) / $self->fheight);
+            my $bottom_lineno = $img->{pos_row} + $img_height_rows;
+
+            next unless $img->{pos_row} <= $bottom_no && $bottom_lineno >= $top_no;
+
+            # Scrolling up: top lines risk garbling
+            if ($new_view_start < $old_view_start) {
+                $need_expose = 1;
+                $min_y = 0;
+                $max_h = $self->height;
+                last;  # Full height needed for scroll up
+            }
+            # Scrolling down: bottom text may cover old image pixels
+            elsif ($new_view_start > $old_view_start) {
+                my $nextend = ($img->{pos_row} - $top_no) * $self->fheight + $img->{height};
+
+                # Image bottom is still below visible area
+                next if $nextend > $self->height;
+
+                $need_expose = 1;
+                my $bottom_fully_visible = $bottom_lineno < $bottom_no;
+
+                if (!$bottom_fully_visible) {
+                    $min_y = $nextend if $nextend < $min_y;
+                    my $h = $self->height - $nextend;
+                    $max_h = $h if $h > $max_h;
+                } else {
+                    # Round back one line for safety
+                    my $y = $nextend - $self->fheight;
+                    $y = 0 if $y < 0;
+                    $min_y = $y if $y < $min_y;
+                    my $curend = ($img->{pos_row} - ($term_start + $old_view_start)) * $self->fheight + $img->{height};
+                    my $h = $curend - $nextend;
+                    $max_h = $h if $h > $max_h;
+                }
+            }
+        }
+
+        if ($need_expose) {
+            $self->{images_need_expose} = 1;
+            $self->{expose_y} = $min_y;
+            $self->{expose_h} = $max_h;
+        }
+    }
+
+    $self->want_refresh();
+
+    1
+}
+
+# Handle refresh begin - clear exposed areas BEFORE text is drawn
+# This is the key to preventing text-over-image artifacts
+# Uses precise expose regions calculated in on_view_change
+sub on_refresh_begin {
+    my ($self) = @_;
+
+    # Safety check - ensure initialization is complete
+    return unless defined $self->{images_need_expose};
+
+    # Guard against infinite recursion
+    return if $self->{in_expose};
+
+    # Check if we need to expose (clear) any areas
+    if ($self->{images_need_expose} == 2) {
+        # Full screen expose - use scr_touch which handles this properly
+        $self->{in_expose} = 1;
+        $self->scr_touch(1);
+        $self->{in_expose} = 0;
+        $self->{images_need_expose} = 0;
+        return 1;
+    }
+    elsif ($self->{images_need_expose} == 1) {
+        # Partial expose - use precise region calculated in on_view_change
+        # This matches the C implementation's approach for better performance
+        # CRITICAL: Pass refresh=0 (false) to avoid infinite recursion
+        if ($self->{expose_h} > 0) {
+            $self->{in_expose} = 1;
+            $self->scr_expose(0, $self->{expose_y}, $self->width, $self->{expose_h}, 0);
+            $self->{in_expose} = 0;
+        }
+        $self->{images_need_expose} = 0;
+        $self->{expose_y} = 0;
+        $self->{expose_h} = 0;
+    }
+
+    1
+}
+
+# Handle window resize - called AFTER resize completes
+# Implements C code's recompute_pos() function
+# CRITICAL: Use on_size_change (not on_resize_all_windows) to get updated dimensions
+sub on_size_change {
+    my ($self, $new_width, $new_height) = @_;
+
+    return unless $self->{images} && @{$self->{images}};
+
+    # At this point, terminal dimensions are already updated:
+    # - $self->ncol has new column count
+    # - $self->nrow has new row count
+    # - $self->fwidth has new font width
+    # - $self->fheight has new font height
+
+    # Recompute positions for images with IMG_WRAP flag
+    # C code: recompute_pos() in image.C lines 210-250
+    foreach my $img (@{$self->{images}}) {
+        my $flags = $img->{flags};
+
+        # Only process images with IMG_WRAP flag
+        next unless $flags & IMG_WRAP;
+
+        # Handle IMG_EOL (end-of-line positioning)
+        if ($flags & IMG_EOL) {
+            # C code: if(t->fwidth < t->col2pixel(pos.col) + width && pos.col != t->ncol - ceil_width())
+            # Check if image needs repositioning
+            my $img_width_cols = int(($img->{width} + $self->fwidth - 1) / $self->fwidth);
+            my $ideal_col = $self->ncol - $img_width_cols;
+            my $current_pixel_pos = $img->{pos_col} * $self->fwidth;
+
+            # Image needs to move if:
+            # 1. Current position + image width exceeds window width, OR
+            # 2. Current position is not at the ideal EOL position
+            if (($self->fwidth < $current_pixel_pos + $img->{width}) &&
+                ($img->{pos_col} != $ideal_col)) {
+                $img->{pos_col} = $ideal_col;
+            }
+        }
+
+        # Note: Row position adjustment for buffer resize is handled automatically
+        # by rxvt's scrollback buffer management (term_start adjustments)
+    }
+
+    # Trigger refresh to redraw images at new positions
+    $self->want_refresh();
+
+    1
+}
+
+# Clean up on reset
+sub on_reset {
+    my ($self) = @_;
+
+    $self->{images} = [];
+    $self->{cumulative_vpad} = 0;
+
+    1
+}
+
+1
