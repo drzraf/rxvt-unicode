@@ -1799,7 +1799,7 @@ rxvt_term::ROW_is_longer (int row_number, int new_is_longer = -1)
 #if HAVE_IMAGES
 
 void
-rxvt_term::set_line_image (int row_number, rxvt_img *img, int col = 0, int flags = 0)
+rxvt_term::set_line_image (int row_number, rxvt_img *img, int col = 0, int flags = 0, int offset_x = 0, int offset_y = 0)
 	CODE:
 {
         if (!IN_RANGE_EXC (row_number, THIS->top_row, THIS->nrow))
@@ -1809,12 +1809,14 @@ rxvt_term::set_line_image (int row_number, rxvt_img *img, int col = 0, int flags
 
         // Create a new line_image_t and clone the rxvt_img (we take ownership of the clone)
         line_image_t *li = new line_image_t;
-        li->img    = img->clone ();
-        li->col    = col;
-        li->flags  = flags;
-        li->width  = img->w;
-        li->height = img->h;
-        li->next   = 0;
+        li->img      = img->clone ();
+        li->col      = col;
+        li->flags    = flags;
+        li->width    = img->w;
+        li->height   = img->h;
+        li->offset_x = offset_x;
+        li->offset_y = offset_y;
+        li->next     = 0;
 
         // Append to the line's image chain (supports multiple images per line)
         l.append_image (li);
@@ -2458,6 +2460,62 @@ rxvt_term::new_img_from_file (octet_string filename)
           {
             croak ("new_img_from_file failed");
           }
+	OUTPUT:
+        RETVAL
+
+rxvt_img *
+rxvt_term::new_img_from_rgba (int width, int height, SV *data_sv, int bpp = 4)
+	CODE:
+{
+        STRLEN data_len;
+        const unsigned char *data = (const unsigned char *)SvPVbyte (data_sv, data_len);
+
+        if ((STRLEN)(width * height * bpp) > data_len)
+          croak ("new_img_from_rgba: data too short for %dx%d at %d bpp", width, height, bpp);
+
+        XRenderPictFormat *format = bpp == 4
+          ? XRenderFindStandardFormat (THIS->dpy, PictStandardARGB32)
+          : XRenderFindStandardFormat (THIS->dpy, PictStandardRGB24);
+
+        if (!format)
+          croak ("new_img_from_rgba: cannot find XRender format");
+
+        RETVAL = new rxvt_img (THIS, format, 0, 0, width, height);
+        RETVAL->alloc ();
+
+        // Paint pixels onto the Pixmap via XImage
+        Display *dpy = THIS->dpy;
+        GC gc = XCreateGC (dpy, RETVAL->pm, 0, 0);
+        XImage *ximage = XCreateImage (dpy, THIS->visual, format->depth, ZPixmap, 0,
+                                       NULL, width, height, 32, 0);
+        ximage->data = (char *)malloc (ximage->bytes_per_line * height);
+
+        for (int y = 0; y < height; y++)
+          for (int x = 0; x < width; x++)
+            {
+              int si = (y * width + x) * bpp;
+              unsigned long pixel;
+              if (bpp == 4)
+                // Convert RGBA to premultiplied ARGB for XRender
+                {
+                  unsigned int r = data[si], g = data[si+1], b = data[si+2], a = data[si+3];
+                  // Premultiply alpha as required by XRender
+                  r = (r * a + 127) / 255;
+                  g = (g * a + 127) / 255;
+                  b = (b * a + 127) / 255;
+                  pixel = ((unsigned long)a << 24) | ((unsigned long)r << 16)
+                         | ((unsigned long)g << 8) | b;
+                }
+              else
+                pixel = ((unsigned long)0xff << 24) | ((unsigned long)data[si] << 16)
+                       | ((unsigned long)data[si+1] << 8) | data[si+2];
+              XPutPixel (ximage, x, y, pixel);
+            }
+
+        XPutImage (dpy, RETVAL->pm, gc, ximage, 0, 0, 0, 0, width, height);
+        XFreeGC (dpy, gc);
+        XDestroyImage (ximage); // frees ximage->data too
+}
 	OUTPUT:
         RETVAL
 

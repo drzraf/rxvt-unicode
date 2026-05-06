@@ -740,9 +740,11 @@ struct line_image_t
    uint16_t  flags;       // image display flags (IMG_EOL, etc.)
    uint16_t  width;       // pixel width of the image
    uint16_t  height;      // pixel height of the image
+   uint8_t   offset_x;    // sub-cell X pixel offset (0..fwidth-1), for Kitty X= key
+   uint8_t   offset_y;    // sub-cell Y pixel offset (0..fheight-1), for Kitty Y= key
 
    line_image_t ()
-   : img(0), next(0), col(0), flags(0), width(0), height(0)
+   : img(0), next(0), col(0), flags(0), width(0), height(0), offset_x(0), offset_y(0)
    {
    }
 
@@ -1508,6 +1510,7 @@ struct rxvt_term : zero_initialized, rxvt_vars, rxvt_screen
   void process_window_ops (const int *args, unsigned int nargs);
   char *get_to_st (string_term &st);
   void process_dcs_seq ();
+  void process_apc_seq ();
   void process_osc_seq ();
   void process_color_seq (int report, int color, const char *str, string_term &st);
   void process_xterm_seq (int op, char *str, string_term &st);

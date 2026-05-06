@@ -1,0 +1,1037 @@
+#! perl
+
+=head1 NAME
+
+kitty-graphics - Kitty graphics protocol for inline image display
+
+=head1 SYNOPSIS
+
+   urxvt -pe kitty-graphics
+
+=head1 DESCRIPTION
+
+This extension implements the Kitty terminal graphics protocol using APC
+(Application Program Command) escape sequences. It supports image transmission,
+display, caching, deletion, and basic animation.
+
+The protocol uses C<ESC _G key=value,...;base64_payload ESC \> sequences.
+See L<https://sw.kovidgoyal.net/kitty/graphics-protocol/> for details.
+
+=head2 Supported Features
+
+=over 4
+
+=item * Transmission: direct (t=d), file (t=f), temp file (t=t)
+
+=item * Formats: PNG (f=100), RGB (f=24), RGBA (f=32)
+
+=item * Compression: zlib (o=z)
+
+=item * Actions: transmit (a=t), transmit+display (a=T), query (a=q),
+display (a=p), delete (a=d), frame (a=f), animate (a=a)
+
+=item * Image caching with IDs (i=N) and image numbers (I=N)
+
+=item * Chunked base64 transmission (m=0/1)
+
+=item * Source rect cropping (x,y,w,h keys)
+
+=item * Cell rect scaling (c,r keys)
+
+=item * Sub-cell pixel offsets (X,Y keys)
+
+=item * Response suppression (q=1/2)
+
+=item * Basic animation with frame data and timer-driven playback
+
+=back
+
+=head2 Known Limitations (Protocol Conformance)
+
+=over 4
+
+=item * z-index (z key) is not supported; all images render at z=0
+
+=item * Shared memory transmission (t=s) is not supported
+
+=item * Unicode placeholders (U=1) are not supported
+
+=item * Relative placements (P,Q,H,V keys) are not supported
+
+=item * Frame composition action (a=c) is not supported
+
+=item * Animation frame compositing (X,Y keys in a=f) is basic
+
+=item * Clear screen (ESC[2J) does not clear images
+
+=back
+
+=head2 Testing
+
+   # Display a PNG image
+   kitten icat /path/to/image.png
+
+   # Or use chafa
+   chafa --format=kitty /path/to/image.png
+
+=cut
+
+use MIME::Base64 ();
+
+sub on_init {
+   my ($self) = @_;
+
+   $self->{images}        = {};   # id => { img, w, h, number }
+   $self->{image_numbers} = {};   # number => id
+   $self->{next_id}       = 4294967295; # auto-assign IDs from high end downward
+   $self->{pending}       = undef;      # chunked upload accumulator
+   $self->{placements}    = {};   # "$id,$pid" => { row, col, ... }
+   $self->{animations}    = {};   # id => { frames, gaps, current, timer, ... }
+
+   1
+}
+
+# ─── APC hook ────────────────────────────────────────────────────────────────
+
+sub on_apc_seq {
+   my ($self, $str, $st) = @_;
+
+   # Kitty graphics APC starts with 'G'
+   return unless substr($str, 0, 1) eq 'G';
+
+   # Fast path for continuation chunks: "Gm=1;..." or "Gm=1,q=N;..."
+   # These are ~80k of 81k chunks for a large image.  Skip full key=value
+   # parsing and multi-level dispatch — just decode + push to accumulator.
+   if ($self->{pending} && $str =~ /\AG(?:m=1|m=1,q=[012])(?:;(.*))?\z/s) {
+      my $payload = $1 // '';
+      push @{$self->{pending}{chunks}},
+         MIME::Base64::decode_base64($payload) if length $payload;
+      return 1;
+   }
+
+   my $body = substr($str, 1);
+
+   # Split control keys and payload at first ';'
+   my ($ctrl, $payload) = split /;/, $body, 2;
+   $payload //= '';
+
+   # Parse key=value pairs
+   my %params;
+   for my $kv (split /,/, $ctrl) {
+      my ($k, $v) = split /=/, $kv, 2;
+      $params{$k} = $v if defined $k && defined $v;
+   }
+
+   $self->handle_graphics (\%params, $payload);
+
+   1   # consumed
+}
+
+# ─── Action dispatch ─────────────────────────────────────────────────────────
+
+sub handle_graphics {
+   my ($self, $p, $payload) = @_;
+
+   # Per spec: specifying both i and I keys in any command is an error.
+   if (($p->{i} // 0) && ($p->{I} // 0)) {
+      return $self->respond ($p, 'EINVAL:specifying both i and I is not allowed');
+   }
+
+   # For chunked transfers, the action from the FIRST chunk determines
+   # the operation. Continuation/final chunks may omit the 'a' key.
+   my $action;
+   if (!exists $p->{a} && $self->{pending}) {
+      $action = $self->{pending}{params}{a} // 't';
+   } else {
+      $action = $p->{a} // 't';
+   }
+
+   if    ($action eq 't') { $self->action_transmit ($p, $payload) }
+   elsif ($action eq 'T') { $self->action_transmit_and_display ($p, $payload) }
+   elsif ($action eq 'q') { $self->action_query ($p, $payload) }
+   elsif ($action eq 'p') { $self->action_display ($p, $payload) }
+   elsif ($action eq 'd') { $self->action_delete ($p, $payload) }
+   elsif ($action eq 'f') { $self->action_frame ($p, $payload) }
+   elsif ($action eq 'a') { $self->action_animate ($p, $payload) }
+   # @todo a=c (compose animation frames) — requires pixel-level compositing
+   #   on rxvt_img objects (alpha blend or overwrite rectangles between frames).
+   #   Spec: compose pixels from source frame rect onto destination frame rect.
+   #   Keys: r=source_frame, c=dest_frame, x,y,w,h=dest_rect, X,Y=src_offset, C=mode
+   elsif ($action eq 'c') { $self->respond ($p, 'ENOTSUP:frame composition not implemented') }
+}
+
+# ─── Chunked reassembly ─────────────────────────────────────────────────────
+
+# Accumulates payload when m=1, returns (merged_params, full_payload) on m=0.
+# Returns undef if still accumulating.
+sub reassemble_chunks {
+   my ($self, $p, $payload) = @_;
+   my $more = $p->{m} // 0;
+
+   if ($more) {
+      # First or middle chunk — accumulate.
+      # Decode each chunk's base64 independently: chafa pads each chunk
+      # with '=', so we can't simply concatenate base64 strings.
+      #
+      # We accumulate decoded chunks in an ARRAY to avoid O(n²) string
+      # concatenation — with 81k chunks (41MB image), naive ".=" would
+      # copy ~1.67 trillion bytes total.  Array + final join is O(n).
+      my $decoded = length($payload) ? MIME::Base64::decode_base64($payload) : '';
+      if (!$self->{pending}) {
+         $self->{pending} = { params => {%$p}, chunks => [ $decoded ] };
+      } else {
+         push @{$self->{pending}{chunks}}, $decoded;
+      }
+      return undef;
+   }
+
+   # Final chunk (m=0) or single-shot (no m key)
+   my ($merged, $full_payload);
+   if ($self->{pending}) {
+      my $decoded = length($payload) ? MIME::Base64::decode_base64($payload) : '';
+      push @{$self->{pending}{chunks}}, $decoded;
+      # Single join — one allocation for the full binary buffer
+      $full_payload = join '', @{$self->{pending}{chunks}};
+      # First chunk's params are base, final chunk's override
+      $merged = { %{$self->{pending}{params}}, %$p };
+      $merged->{_predecoded} = 1;   # payload is already raw binary
+      $self->{pending} = undef;
+   } else {
+      $full_payload = $payload;
+      $merged = $p;
+   }
+
+   return [$merged, $full_payload];
+}
+
+# ─── a=t: Transmit (store, don't display) ───────────────────────────────────
+
+sub action_transmit {
+   my ($self, $p, $payload) = @_;
+
+   my $result = $self->reassemble_chunks ($p, $payload);
+   return unless $result;
+   my ($mp, $fp) = @$result;
+
+   my $img = $self->decode_image ($mp, $fp);
+   return $self->respond ($mp, 'ENODATA:could not decode image') unless $img;
+
+   my $id = $self->store_image ($mp, $img);
+   return unless $id;
+
+   $self->respond ($mp, 'OK');
+}
+
+# ─── a=T: Transmit and display ──────────────────────────────────────────────
+
+sub action_transmit_and_display {
+   my ($self, $p, $payload) = @_;
+
+   my $result = $self->reassemble_chunks ($p, $payload);
+   return unless $result;
+   my ($mp, $fp) = @$result;
+
+   my $img = $self->decode_image ($mp, $fp);
+   return $self->respond ($mp, 'ENODATA:could not decode image') unless $img;
+
+   my $id = $self->store_image ($mp, $img);
+   $self->place_image ($mp, $id);
+   $self->respond ($mp, 'OK');
+}
+
+# ─── a=q: Query (validate, don't store) ─────────────────────────────────────
+
+sub action_query {
+   my ($self, $p, $payload) = @_;
+
+   my $result = $self->reassemble_chunks ($p, $payload);
+   return unless $result;
+   my ($mp, $fp) = @$result;
+
+   my $img = $self->decode_image ($mp, $fp);
+   if ($img) {
+      $self->respond ($mp, 'OK');
+   } else {
+      $self->respond ($mp, 'ENODATA:could not load image');
+   }
+}
+
+# ─── a=p: Display (place cached image) ──────────────────────────────────────
+
+sub action_display {
+   my ($self, $p, $payload) = @_;
+   my $id = $self->resolve_image_id ($p);
+
+   return $self->respond ($p, 'ENOENT:image not found')
+      unless defined $id && exists $self->{images}{$id};
+
+   $self->place_image ($p, $id);
+   $self->respond ($p, 'OK');
+}
+
+# ─── a=d: Delete ─────────────────────────────────────────────────────────────
+
+sub action_delete {
+   my ($self, $p, $payload) = @_;
+   my $what = $p->{d} // 'a';
+
+   # Per spec: if an image is being loaded in chunks and the upload is not
+   # complete when any delete command is received, the partial upload must
+   # be aborted.
+   $self->{pending} = undef;
+
+   # Uppercase = also free stored image data from cache
+   my $free_data = ($what eq uc $what) ? 1 : 0;
+   $what = lc $what;
+
+   if ($what eq 'a') {
+      # Delete all visible placements on screen
+      for my $row (0 .. $self->nrow - 1) {
+         $self->clear_line_image ($row) if $self->has_line_image ($row);
+      }
+      if ($free_data) {
+         $self->{images} = {};
+         $self->{image_numbers} = {};
+         $self->{animations} = {};
+      }
+      $self->{placements} = {};
+   }
+   elsif ($what eq 'i') {
+      # Delete by image id (and optionally placement id)
+      my $id  = $self->resolve_image_id ($p);
+      my $pid = $p->{p} // 0;
+      $self->delete_placements_for_image ($id, $pid) if defined $id;
+      if ($free_data && defined $id) {
+         $self->stop_animation ($id);
+         delete $self->{images}{$id};
+         delete $self->{animations}{$id};
+      }
+   }
+   elsif ($what eq 'n') {
+      # Delete by image number
+      my $number = $p->{I} // 0;
+      if ($number && exists $self->{image_numbers}{$number}) {
+         my $id = $self->{image_numbers}{$number};
+         $self->delete_placements_for_image ($id);
+         if ($free_data) {
+            $self->stop_animation ($id);
+            delete $self->{images}{$id};
+            delete $self->{animations}{$id};
+            delete $self->{image_numbers}{$number};
+         }
+      }
+   }
+   elsif ($what eq 'c') {
+      # Delete all placements that intersect with the current cursor position
+      my ($row, $col) = $self->screen_cur;
+      # @todo should check all placements intersecting this cell, not just
+      #   the line image on the cursor row. Requires tracking placement
+      #   geometry (multi-row/multi-col) in {placements}.
+      $self->clear_line_image ($row) if $self->has_line_image ($row);
+   }
+   elsif ($what eq 'p') {
+      # Per spec: delete all placements that intersect a specific cell,
+      # specified using the x and y keys (1-based coordinates).
+      my $col = ($p->{x} // 1) - 1;   # convert to 0-based
+      my $row = ($p->{y} // 1) - 1;
+      # @todo should find all placements whose rendered area overlaps (row,col).
+      #   Currently we only have single-row placement tracking, so we just
+      #   clear the image on the specified row if the column matches.
+      if ($row >= 0 && $row < $self->nrow && $self->has_line_image ($row)) {
+         $self->clear_line_image ($row);
+      }
+   }
+   elsif ($what eq 'q') {
+      # @todo d=q: delete all placements intersecting a specific cell with
+      #   a specific z-index. Requires z-index support.
+      #   Keys: x (col, 1-based), y (row, 1-based), z (z-index).
+   }
+   elsif ($what eq 'r') {
+      # Delete all images with id in range [x..y]
+      my $lo = $p->{x} // 0;
+      my $hi = $p->{y} // 0;
+      if ($lo && $hi && $lo <= $hi) {
+         for my $id ($lo .. $hi) {
+            $self->delete_placements_for_image ($id) if exists $self->{images}{$id};
+            if ($free_data && exists $self->{images}{$id}) {
+               $self->stop_animation ($id);
+               delete $self->{images}{$id};
+               delete $self->{animations}{$id};
+            }
+         }
+      }
+   }
+   elsif ($what eq 'x') {
+      # Delete all placements that intersect the specified column (1-based)
+      my $col = ($p->{x} // 1) - 1;   # convert to 0-based
+      for my $row (0 .. $self->nrow - 1) {
+         if ($self->has_line_image ($row)) {
+            # @todo should check if placement rectangle spans this column.
+            #   Currently we store placement col but not width, so we check
+            #   if the placement starts at this column.
+            my $found = 0;
+            for my $key (keys %{$self->{placements}}) {
+               my $pl = $self->{placements}{$key};
+               $found = 1 if $pl->{row} == $row && $pl->{col} == $col;
+            }
+            $self->clear_line_image ($row) if $found;
+         }
+      }
+   }
+   elsif ($what eq 'y') {
+      # Delete all placements that intersect the specified row (1-based)
+      my $row = ($p->{y} // 1) - 1;   # convert to 0-based
+      $self->clear_line_image ($row) if $row >= 0 && $row < $self->nrow && $self->has_line_image ($row);
+   }
+   elsif ($what eq 'z') {
+      # Delete all placements with the specified z-index
+      # @todo z-index not tracked; treating all as z=0, so z=0 deletes all.
+      my $z = $p->{z} // 0;
+      if ($z == 0) {
+         for my $row (0 .. $self->nrow - 1) {
+            $self->clear_line_image ($row) if $self->has_line_image ($row);
+         }
+         if ($free_data) {
+            $self->{images} = {};
+            $self->{image_numbers} = {};
+         }
+      }
+   }
+   elsif ($what eq 'f') {
+      # @todo d=f: delete animation frames. Spec does not detail which frames
+      #   to delete beyond the d=f/F key. Kitty source suggests it deletes
+      #   all frames for the specified image, reverting it to a still image.
+      my $id = $self->resolve_image_id ($p);
+      if (defined $id && exists $self->{animations}{$id}) {
+         $self->stop_animation ($id);
+         delete $self->{animations}{$id};
+      }
+   }
+
+   $self->want_refresh;
+}
+
+# ─── a=f: Frame transmission (animation) ────────────────────────────────────
+
+sub action_frame {
+   my ($self, $p, $payload) = @_;
+
+   my $result = $self->reassemble_chunks ($p, $payload);
+   return unless $result;
+   my ($mp, $fp) = @$result;
+
+   my $id = $self->resolve_image_id ($mp);
+   return $self->respond ($mp, 'ENOENT:image not found')
+      unless defined $id && exists $self->{images}{$id};
+
+   # Decode frame image data (if payload present)
+   my $img;
+   if (length $fp) {
+      $img = $self->decode_image ($mp, $fp);
+      return $self->respond ($mp, 'ENODATA:could not decode frame') unless $img;
+   }
+
+   # Initialize animation structure if needed
+   my $anim = $self->{animations}{$id} //= {
+      frames  => [ $self->{images}{$id}{img} ], # frame 0 = root image
+      gaps    => [ 0 ],
+      current => 0,
+      state   => 0,
+      loops   => 0,
+      timer   => undef,
+   };
+
+   my $edit_frame = $mp->{r} // 0;  # edit/replace existing frame (1-based)
+   my $gap        = $mp->{z} // 0;  # frame gap in ms
+   my $base_frame = $mp->{c} // 0;  # compose onto this frame (1-based)
+   # @todo $compose_mode (X key): 0=alpha blend onto base, 1=simple overwrite.
+   #   Currently we store frames directly without compositing onto base frame.
+   #   Full support requires pixel-level alpha blending on rxvt_img objects.
+   my $compose_mode = $mp->{X} // 0;
+   # @todo $bg_color (Y key): 32-bit RGBA background color for pixels not
+   #   specified in the frame data. Currently ignored (defaults to transparent).
+   my $bg_color = $mp->{Y} // 0;
+
+   if ($edit_frame && $edit_frame <= scalar @{$anim->{frames}}) {
+      # Replace existing frame data
+      $anim->{frames}[$edit_frame - 1] = $img if $img;
+      $anim->{gaps}[$edit_frame - 1] = $gap if $gap;
+   } else {
+      # Append new frame
+      if ($img) {
+         # @todo When base_frame (c key) is specified, the new frame should
+         #   be composed onto a copy of the base frame's pixel data using the
+         #   composition mode (X key). Currently we just store the frame as-is.
+         push @{$anim->{frames}}, $img;
+         push @{$anim->{gaps}}, ($gap || 40);
+      }
+   }
+
+   $self->respond ($mp, 'OK');
+}
+
+# ─── a=a: Animation control ─────────────────────────────────────────────────
+
+sub action_animate {
+   my ($self, $p, $payload) = @_;
+   my $id = $self->resolve_image_id ($p);
+
+   return $self->respond ($p, 'ENOENT:image not found')
+      unless defined $id;
+
+   my $anim = $self->{animations}{$id};
+   return $self->respond ($p, 'ENOENT:not an animation')
+      unless $anim;
+
+   # Set frame gap for a specific frame
+   if (defined $p->{r} && defined $p->{z}) {
+      my $r = $p->{r};
+      $anim->{gaps}[$r - 1] = $p->{z}
+         if $r >= 1 && $r <= scalar @{$anim->{gaps}};
+   }
+
+   # Jump to specific frame (1-based)
+   if (my $c = $p->{c}) {
+      $self->show_frame ($id, $c - 1);
+   }
+
+   # Animation state control
+   if (defined $p->{s}) {
+      my $s = $p->{s};
+      if ($s == 1) {
+         # Stop animation
+         $self->stop_animation ($id);
+      }
+      elsif ($s == 2 || $s == 3) {
+         # Start animation: 2 = loading mode, 3 = normal
+         $anim->{state} = $s;
+
+         # Loop control (v key): 0=ignore, 1=infinite, N=loop N-1 times
+         my $v = $p->{v} // 0;
+         if ($v == 1) {
+            $anim->{loops} = -1;  # infinite
+         } elsif ($v > 1) {
+            $anim->{loops} = $v - 1;
+         }
+
+         $self->start_animation ($id);
+      }
+   }
+
+   $self->respond ($p, 'OK');
+}
+
+# ─── Image decoding ─────────────────────────────────────────────────────────
+
+sub decode_image {
+   my ($self, $p, $payload) = @_;
+
+   my $t       = $p->{t} // 'd';   # transmission medium
+   my $format  = $p->{f} // 32;    # pixel format
+   my $compress = $p->{o};          # compression
+
+   my $raw;
+
+   if ($t eq 'd') {
+      if ($p->{_predecoded}) {
+         # Already decoded by reassemble_chunks (chunked transfer)
+         $raw = $payload;
+      } else {
+         # Direct: payload is base64 data
+         $raw = MIME::Base64::decode_base64 ($payload);
+      }
+   }
+   elsif ($t eq 'f' || $t eq 't') {
+      # File path (base64-encoded)
+      my $path;
+      if ($p->{_predecoded}) {
+         $path = $payload;
+      } else {
+         $path = MIME::Base64::decode_base64 ($payload);
+      }
+      $path =~ s/\0+$//;   # strip trailing NULs
+
+      # Security: only regular files, no symlink traversal to special files
+      return undef unless -f $path;
+
+      # Per spec: refuse to read files in sensitive filesystem areas
+      return undef if $path =~ m{^/(proc|sys|dev)/};
+
+      # Per spec: for temp files (t=t), only delete if the file is in a
+      # known temporary directory AND has "tty-graphics-protocol" in its path.
+      my $should_unlink = 0;
+      if ($t eq 't') {
+         my $tmpdir = $ENV{TMPDIR} // '/tmp';
+         if (($path =~ m{^/tmp/} || $path =~ m{^/dev/shm/} || $path =~ m{^\Q$tmpdir\E/})
+             && $path =~ /tty-graphics-protocol/) {
+            $should_unlink = 1;
+         }
+      }
+
+      if ($format == 100) {
+         # PNG file — load directly
+         my $img = eval { $self->new_img_from_file ($path) };
+         unlink $path if $should_unlink;
+         return $img;
+      }
+
+      # Raw pixel data from file
+      my $size   = $p->{S} || -s $path;
+      my $offset = $p->{O} || 0;
+
+      open my $fh, '<:raw', $path or return undef;
+      seek $fh, $offset, 0 if $offset;
+      my $bytes_read = read $fh, $raw, $size;
+      close $fh;
+      unlink $path if $should_unlink;
+      return undef unless $bytes_read;
+   }
+   elsif ($t eq 's') {
+      # @todo t=s (shared memory): POSIX shm_open() is not available from Perl
+      #   without XS or Inline::C. Would need to open /dev/shm/<name> as a file,
+      #   read the data, then shm_unlink. Low priority since most clients fall
+      #   back to direct or file transmission.
+      return undef;
+   }
+   else {
+      return undef;
+   }
+
+   return undef unless defined $raw && length $raw;
+
+   # Decompress if needed
+   if ($compress && $compress eq 'z') {
+      eval { require Compress::Zlib };
+      if ($@) {
+         warn "kitty-graphics: Compress::Zlib not available for o=z\n";
+         return undef;
+      }
+      $raw = Compress::Zlib::uncompress ($raw);
+      return undef unless defined $raw;
+   }
+
+   if ($format == 100) {
+      # PNG data — write to temp, load, delete
+      return $self->load_png_data ($raw);
+   }
+   elsif ($format == 24) {
+      # Raw RGB — s=width, v=height per spec
+      my $w = $p->{s} or return undef;
+      my $h = $p->{v} or return undef;
+      return eval { $self->new_img_from_rgba ($w, $h, $raw, 3) };
+   }
+   elsif ($format == 32) {
+      # Raw RGBA — s=width, v=height per spec
+      my $w = $p->{s} or return undef;
+      my $h = $p->{v} or return undef;
+      return eval { $self->new_img_from_rgba ($w, $h, $raw, 4) };
+   }
+
+   return undef;
+}
+
+sub load_png_data {
+   my ($self, $data) = @_;
+
+   my $tmp = "/tmp/urxvt-kitty-graphics-$$.png";
+   open my $fh, '>:raw', $tmp or return undef;
+   print $fh $data;
+   close $fh;
+
+   my $img = eval { $self->new_img_from_file ($tmp) };
+   unlink $tmp;
+   return $img;
+}
+
+# ─── Image cache ─────────────────────────────────────────────────────────────
+
+# @todo Image storage quota: spec recommends a maximum storage quota (kitty
+#   uses 320MB per buffer). We should track total image bytes and evict oldest
+#   images when the quota is exceeded. Currently no quota is enforced.
+
+sub store_image {
+   my ($self, $p, $img) = @_;
+
+   my $id     = $p->{i} // 0;
+   my $number = $p->{I} // 0;
+
+   if ($number && !$id) {
+      # Per spec: "When creating a new image, even if an existing image has
+      # the same number a new one is created" — auto-assign a unique ID.
+      $id = $self->{next_id}--;
+      $self->{image_numbers}{$number} = $id;
+      # Reflect assigned id back so response includes it
+      $p->{i} = $id;
+   }
+
+   $id ||= 0;  # anonymous images use id=0
+
+   # Per spec: "When re-transmitting image data for a specific id, the existing
+   # image and all its placements must be deleted."
+   if ($id && exists $self->{images}{$id}) {
+      $self->delete_placements_for_image ($id);
+      $self->stop_animation ($id);
+      delete $self->{images}{$id};
+      delete $self->{animations}{$id};
+   }
+
+   $self->{images}{$id} = {
+      img    => $img,
+      w      => $img->w,
+      h      => $img->h,
+      number => $number,
+   };
+
+   return $id;
+}
+
+sub resolve_image_id {
+   my ($self, $p) = @_;
+   my $id     = $p->{i} // 0;
+   my $number = $p->{I} // 0;
+
+   if ($number && !$id) {
+      $id = $self->{image_numbers}{$number};
+   }
+
+   return $id;
+}
+
+# ─── Placement ───────────────────────────────────────────────────────────────
+
+# @todo z-index (z key): the spec requires support for vertical stacking order.
+#   Negative z-index means drawing under text, values below INT32_MIN/2
+#   (-1073741824) draw under non-default background cells. This requires C-level
+#   changes to line_image_t and the rendering pipeline in rxvtperl.xs/screen.C
+#   to sort and composite images by z-order.
+
+# @todo Unicode placeholders (U=1): the spec allows creating "virtual placements"
+#   that are positioned via U+10EEEE characters in the text stream. This requires
+#   text rendering integration to detect the placeholder character and its
+#   diacritics, then map them to image placements. Very complex to implement.
+
+# @todo Relative placements (P,Q,H,V keys): allows positioning an image relative
+#   to another placement. Requires tracking placement screen positions and
+#   updating relative placements when parents move. Needs chain-depth limiting
+#   and cycle detection per spec.
+
+sub place_image {
+   my ($self, $p, $id) = @_;
+
+   my $entry = $self->{images}{$id};
+   return unless $entry;
+
+   my $img = $entry->{img};
+
+   # Source rect cropping (x,y,w,h)
+   my $sx = $p->{x} // 0;
+   my $sy = $p->{y} // 0;
+   my $sw = $p->{w} // 0;
+   my $sh = $p->{h} // 0;
+
+   my $display_img = $img;
+
+   if ($sx || $sy || $sw || $sh) {
+      $sw ||= $img->w - $sx;
+      $sh ||= $img->h - $sy;
+      # Per spec: "displayed area is the intersection of the specified
+      # rectangle with the source image rectangle"
+      $sw = $img->w - $sx if $sx + $sw > $img->w;
+      $sh = $img->h - $sy if $sy + $sh > $img->h;
+      $display_img = eval { $img->sub_rect ($sx, $sy, $sw, $sh) };
+      $display_img //= $img;
+   }
+
+   # Dest cell rect scaling (c=columns, r=rows)
+   my $cols = $p->{c} // 0;
+   my $rows = $p->{r} // 0;
+
+   if ($cols || $rows) {
+      my $tw = $cols ? $cols * $self->fwidth  : 0;
+      my $th = $rows ? $rows * $self->fheight : 0;
+
+      # Per spec: "If only one of either r or c is specified, the other one
+      # is computed based on the source image aspect ratio"
+      if ($tw && !$th) {
+         $th = int ($display_img->h * $tw / ($display_img->w || 1));
+      }
+      if ($th && !$tw) {
+         $tw = int ($display_img->w * $th / ($display_img->h || 1));
+      }
+
+      $display_img = eval { $display_img->scale ($tw, $th) } if $tw && $th;
+   }
+
+   # Get cursor position — per spec: "the cursor position used to display the
+   # image must be the position when the final chunk is received"
+   my ($cur_row, $cur_col) = $self->screen_cur;
+
+   # Sub-cell pixel offsets — per spec: "offsets must be smaller than the
+   # size of the cell"
+   my $offset_x = $p->{X} // 0;
+   my $offset_y = $p->{Y} // 0;
+
+   # Clamp offsets to cell dimensions
+   $offset_x = $self->fwidth  - 1 if $offset_x >= $self->fwidth;
+   $offset_y = $self->fheight - 1 if $offset_y >= $self->fheight;
+
+   # Attach image to line
+   $self->set_line_image ($cur_row, $display_img, $cur_col, 0, $offset_x, $offset_y);
+
+   # Track placement
+   my $placement_id = $p->{p} // 0;
+   if ($id) {
+      my $pkey = "$id,$placement_id";
+      # Per spec: "If you send two placements with the same image id and
+      # placement id the second one will replace the first."
+      if ($placement_id && exists $self->{placements}{$pkey}) {
+         my $old = $self->{placements}{$pkey};
+         my $old_row = $old->{row};
+         $self->clear_line_image ($old_row)
+            if $old_row >= 0 && $old_row < $self->nrow && $self->has_line_image ($old_row);
+      }
+      $self->{placements}{$pkey} = {
+         row => $cur_row,
+         col => $cur_col,
+         id  => $id,
+      };
+   }
+
+   # Cursor movement per spec:
+   # "the cursor must be moved to the right by the number of cols in the
+   #  image placement rectangle and down by the number of rows"
+   # C=1 means don't move cursor at all.
+   my $cursor_policy = $p->{C} // 0;
+   unless ($cursor_policy) {
+      my $img_w = $display_img->w;
+      my $img_h = $display_img->h;
+
+      # Placement rectangle in cells — use c/r if explicitly given,
+      # otherwise compute from image pixel dimensions
+      my $img_cols = $cols || int (($img_w + $self->fwidth  - 1) / $self->fwidth);
+      my $img_rows = $rows || int (($img_h + $self->fheight - 1) / $self->fheight);
+
+      # Move cursor down by img_rows and right by img_cols.
+      # cmd_parse("\n") moves cursor down one row; when at the bottom of
+      # the scroll region it scrolls instead.
+      if ($img_rows > 0) {
+         $self->cmd_parse ("\n" x $img_rows);
+      }
+
+      # Position cursor at correct column (col + img_cols)
+      # Per spec: "If either of these cause the cursor to leave either the
+      # screen or the scroll area, the exact positioning of the cursor is
+      # undefined, and up to implementations."
+      my @cur = $self->screen_cur;
+      my $new_col = $cur_col + $img_cols;
+      $new_col = 0 if $new_col >= $self->ncol;  # wrap to col 0
+      $self->screen_cur ($cur[0], $new_col);
+   }
+
+   $self->want_refresh;
+}
+
+# ─── Placement management ───────────────────────────────────────────────────
+
+sub delete_placements_for_image {
+   my ($self, $id, $pid) = @_;
+
+   for my $key (keys %{$self->{placements}}) {
+      my ($img_id, $place_id) = split /,/, $key;
+      next unless $img_id == $id;
+      next if defined $pid && $pid && $place_id != $pid;
+
+      my $pl  = $self->{placements}{$key};
+      my $row = $pl->{row};
+
+      if ($row >= $self->top_row && $row < $self->nrow) {
+         $self->clear_line_image ($row) if $self->has_line_image ($row);
+      }
+
+      delete $self->{placements}{$key};
+   }
+
+   $self->want_refresh;
+}
+
+# ─── Response protocol ───────────────────────────────────────────────────────
+
+sub respond {
+   my ($self, $p, $msg) = @_;
+   my $q = $p->{q} // 0;
+
+   # q=1: suppress OK responses only
+   return if $q == 1 && $msg eq 'OK';
+   # q=2: suppress all responses (both OK and errors)
+   return if $q == 2;
+
+   my $id     = $p->{i} // 0;
+   my $number = $p->{I} // 0;
+
+   # Per spec, responses go back to the child process via the pty.
+   # When no image ID/number is given (anonymous image, e.g. chafa),
+   # suppress OK responses — the child likely won't read them and
+   # they leak as visible text when the child exits.
+   if (!$id && !$number && $msg eq 'OK') {
+      return;
+   }
+
+   my $resp = "\033_G";
+   my @parts;
+   push @parts, "i=$id"     if $id;
+   push @parts, "I=$number" if $number;
+
+   my $placement = $p->{p} // 0;
+   push @parts, "p=$placement" if $placement;
+
+   $resp .= join (',', @parts) if @parts;
+   $resp .= ";$msg\033\\";
+
+   $self->tt_write ($resp);
+}
+
+# ─── Animation ───────────────────────────────────────────────────────────────
+
+sub show_frame {
+   my ($self, $id, $frame_idx) = @_;
+   my $anim = $self->{animations}{$id} or return;
+   my $frames = $anim->{frames};
+
+   return if $frame_idx < 0 || $frame_idx >= scalar @$frames;
+
+   $anim->{current} = $frame_idx;
+   my $frame_img = $frames->[$frame_idx];
+
+   # Update all placements for this image
+   for my $key (keys %{$self->{placements}}) {
+      my ($img_id, $place_id) = split /,/, $key;
+      next unless $img_id == $id;
+
+      my $pl  = $self->{placements}{$key};
+      my $row = $pl->{row};
+      my $col = $pl->{col};
+
+      next unless $row >= $self->top_row && $row < $self->nrow;
+
+      # Clear old and set new frame
+      $self->clear_line_image ($row) if $self->has_line_image ($row);
+      $self->set_line_image ($row, $frame_img, $col, 0);
+   }
+
+   $self->want_refresh;
+}
+
+sub start_animation {
+   my ($self, $id) = @_;
+   my $anim = $self->{animations}{$id} or return;
+
+   # Don't start if already running
+   return if $anim->{timer};
+
+   my $advance;
+   $advance = sub {
+      my $frames = $anim->{frames};
+      return unless @$frames > 1;
+
+      my $next = ($anim->{current} + 1) % scalar @$frames;
+
+      # In loading mode (state=2), stop when wrapping back to frame 0
+      if ($anim->{state} == 2 && $next == 0) {
+         $self->stop_animation ($id);
+         return;
+      }
+
+      $self->show_frame ($id, $next);
+
+      # Loop counting (only when wrapping from last to first)
+      if ($next == 0 && $anim->{loops} > 0) {
+         $anim->{loops}--;
+         if ($anim->{loops} == 0) {
+            $self->stop_animation ($id);
+            return;
+         }
+      }
+
+      # Schedule next frame — per spec: negative gap = gapless (instant),
+      # zero gap is ignored (use default 40ms)
+      my $gap = $anim->{gaps}[$next] // 40;
+      if ($gap < 0) {
+         # Negative gap = gapless, advance immediately
+         $advance->();
+      } else {
+         $gap = 40 if $gap == 0;
+         $anim->{timer} = urxvt::timer->new
+            ->after ($gap / 1000.0)
+            ->cb (sub {
+               delete $anim->{timer};
+               $advance->();
+            });
+      }
+   };
+
+   # Start with current frame's gap
+   my $initial_gap = $anim->{gaps}[$anim->{current}] // 40;
+   $initial_gap = 40 if $initial_gap <= 0;
+   $anim->{timer} = urxvt::timer->new
+      ->after ($initial_gap / 1000.0)
+      ->cb (sub {
+         delete $anim->{timer};
+         $advance->();
+      });
+}
+
+sub stop_animation {
+   my ($self, $id) = @_;
+   my $anim = $self->{animations}{$id} or return;
+   delete $anim->{timer};
+   $anim->{state} = 0;
+}
+
+# ─── Window resize handling ──────────────────────────────────────────────────
+
+sub on_size_change {
+   my ($self, $new_width, $new_height) = @_;
+   $self->{in_resize} = 1;
+   $self->want_refresh;
+   1
+}
+
+sub on_reset {
+   my ($self) = @_;
+
+   if ($self->{in_resize}) {
+      $self->{in_resize} = 0;
+   } else {
+      # Per spec: "When resetting the terminal, all images that are visible
+      # on the screen must be cleared."
+      for my $row ($self->top_row .. $self->nrow - 1) {
+         $self->clear_line_image ($row) if $self->has_line_image ($row);
+      }
+      $self->{images}        = {};
+      $self->{image_numbers} = {};
+      $self->{placements}    = {};
+      # Stop all animations
+      for my $id (keys %{$self->{animations}}) {
+         $self->stop_animation ($id);
+      }
+      $self->{animations} = {};
+   }
+
+   1
+}
+
+# ─── Notes on terminal interaction hooks ─────────────────────────────────────
+#
+# @todo Clear screen (ESC[2J): Per spec, "The clear screen escape code
+#   (usually ESC[2J) should also clear all images."  scr_erase_screen(2) in
+#   screen.C handles the text clearing but does NOT invoke any Perl hook.
+#   There is no HOOK_ERASE_SCREEN in hookinc.h.  To support this, a new hook
+#   would need to be added to hookinc.h:
+#     def (ERASE_SCREEN)
+#   and invoked from scr_erase_screen() in screen.C:
+#     HOOK_INVOKE ((this, HOOK_ERASE_SCREEN, DT_INT, mode, DT_END));
+#   Then this plugin could implement on_erase_screen to clear images.
+#   This hook would also be useful for other Perl extensions that manage
+#   screen content (overlays, status bars, etc.).
+
+1

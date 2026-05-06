@@ -2577,6 +2577,9 @@ rxvt_term::process_nonprinting (unicode_t ch)
       case 0x9d:		/* OSC */
         process_osc_seq ();
         break;
+      case 0x9f:		/* APC */
+        process_apc_seq ();
+        break;
 #endif
     }
 }
@@ -2755,6 +2758,11 @@ rxvt_term::process_escape_seq ()
         /* 8.3.90: OPERATING SYSTEM COMMAND (OSC) */
       case C1_OSC:		/* ESC ] */
         process_osc_seq ();
+        break;
+
+        /* 8.3.2: APPLICATION PROGRAM COMMAND (APC) */
+      case C1_APC:		/* ESC _ */
+        process_apc_seq ();
         break;
 
         /* 8.3.106: RESET TO INITIAL STATE (RIS) */
@@ -3305,6 +3313,23 @@ rxvt_term::process_dcs_seq ()
     free (s);
 
   return;
+}
+
+/*----------------------------------------------------------------------*/
+/*
+ * process APPLICATION PROGRAM COMMAND sequence `ESC _ ... (ST|BEL)' or `0x9f ... (ST|BEL)'
+ * Used by the Kitty graphics protocol: ESC _G<control>;<payload> ESC \
+ */
+void
+rxvt_term::process_apc_seq ()
+{
+  string_term st;
+  char *s = get_to_st (st);
+  if (s)
+    {
+      HOOK_INVOKE ((this, HOOK_APC_SEQ, DT_STR, s, DT_STR, st.v, DT_END));
+      free (s);
+    }
 }
 
 /*----------------------------------------------------------------------*/

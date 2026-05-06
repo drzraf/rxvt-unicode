@@ -3992,8 +3992,8 @@ rxvt_term::render_line_images () noexcept
             }
 
           // Calculate screen position: row relative to top of visible area
-          int pixel_x = img_col * fwidth;
-          int pixel_y = (row - view_start) * fheight;
+          int pixel_x = img_col * fwidth + li->offset_x;
+          int pixel_y = (row - view_start) * fheight + li->offset_y;
 
           // Composite with automatic 4-edge clipping against the viewport
           li->img->clipped_composite_onto (dst_pic, pixel_x, pixel_y,

@@ -19,6 +19,7 @@
   def (ADD_LINES)
   def (OSC_SEQ)
   def (OSC_SEQ_PERL)
+  def (APC_SEQ)
   def (TT_WRITE)
 
   def (REFRESH_BEGIN)
