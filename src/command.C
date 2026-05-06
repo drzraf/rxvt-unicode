@@ -3253,7 +3253,13 @@ rxvt_term::get_to_st (string_term &st)
   unicode_t ch;
   bool seen_esc = false;
   unsigned int n = 0;
-  wchar_t string[CBUFSIZ];
+
+  // Start with a modest stack buffer; switch to heap if the sequence is large
+  // (e.g. Kitty graphics stream mode sends up to 128 KB base64 per APC).
+  static const unsigned int STACK_BUFSZ = 4096;
+  wchar_t stack_buf[STACK_BUFSZ];
+  wchar_t *string = stack_buf;
+  unsigned int alloc = STACK_BUFSZ;
 
   while ((ch = cmd_getc ()) != NOCHAR)
     {
@@ -3262,7 +3268,10 @@ rxvt_term::get_to_st (string_term &st)
           if (ch == 0x5c)	/* 7bit ST */
             break;
           else
-            return NULL;
+            {
+              if (string != stack_buf) free (string);
+              return NULL;
+            }
         }
       else if (ch == C0_ESC)
         {
@@ -3274,18 +3283,43 @@ rxvt_term::get_to_st (string_term &st)
       else if (ch == C0_SYN)
         ch = cmd_get8 ();
       else if (ch < 0x20)
-        return NULL;	/* other control character - exit */
+        {
+          if (string != stack_buf) free (string);
+          return NULL;	/* other control character - exit */
+        }
 
       seen_esc = false;
 
-      if (n >= sizeof (string) - 1)
-        // stop at some sane length
-        return NULL;
+      if (n >= alloc - 1)
+        {
+          // need to grow — cap at 4 MB to prevent runaway sequences
+          if (alloc >= 4 * 1024 * 1024)
+            {
+              if (string != stack_buf) free (string);
+              return NULL;
+            }
+
+          unsigned int new_alloc = alloc * 2;
+          wchar_t *new_buf = (wchar_t *)rxvt_malloc (new_alloc * sizeof (wchar_t));
+
+          memcpy (new_buf, string, n * sizeof (wchar_t));
+
+          if (string != stack_buf)
+            free (string);
+
+          string = new_buf;
+          alloc = new_alloc;
+        }
 
       string[n++] = ch;
     }
 
   string[n++] = '\0';
+
+  char *result = rxvt_wcstombs (string);
+
+  if (string != stack_buf)
+    free (string);
 
   n = 0;
   if (ch == 0x5c)
@@ -3293,7 +3327,7 @@ rxvt_term::get_to_st (string_term &st)
   st.v[n++] = ch;
   st.v[n] = '\0';
 
-  return rxvt_wcstombs (string);
+  return result;
 }
 
 /*----------------------------------------------------------------------*/
