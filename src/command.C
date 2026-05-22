@@ -3282,6 +3282,8 @@ rxvt_term::get_to_st (string_term &st)
         break;
       else if (ch == C0_SYN)
         ch = cmd_get8 ();
+      else if (ch == C0_LF || ch == C0_CR)
+        continue;  // skip newlines in payload (e.g. base64 MIME line breaks from chafa)
       else if (ch < 0x20)
         {
           if (string != stack_buf) free (string);
